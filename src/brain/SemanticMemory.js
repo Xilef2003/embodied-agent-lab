@@ -72,7 +72,8 @@ export class SemanticMemory {
             hazards,
             chargingTargets,
             relationCount: this.relations.edges.length,
-            affordanceCount: this.affordances.toJSON().length
+            affordanceCount: this.affordances.toJSON().length,
+            recentSemanticEvents: this.affordances.getRecentEvents(8)
         };
     }
 
@@ -87,6 +88,33 @@ export class SemanticMemory {
             visibleEntities,
             visibleConcepts: [...new Set(visibleEntities.map(item => item.concept))]
         };
+    }
+
+    addRelation(subject, relation, object, confidence = 1, source = "manual", context = "global") {
+        if (this.hasRelation(subject, relation, object)) {
+            return null;
+        }
+
+        return this.relations.addRelation(
+            subject,
+            relation,
+            object,
+            confidence,
+            source,
+            context
+        );
+    }
+
+    hasRelation(subject, relation, object) {
+        return this.relations.hasRelation(subject, relation, object);
+    }
+
+    reinforceAffordance(concept, affordance, amount = 0.06, reason = "experience") {
+        return this.affordances.reinforceAffordance(concept, affordance, amount, reason);
+    }
+
+    weakenAffordance(concept, affordance, amount = 0.04, reason = "experience") {
+        return this.affordances.weakenAffordance(concept, affordance, amount, reason);
     }
 
     explainConcept(concept) {
@@ -108,15 +136,41 @@ export class SemanticMemory {
         if (label) {
             const directMap = {
                 plastikflasche: "plastikflasche",
+                flasche: "plastikflasche",
+
                 dose: "dose",
+                dosen: "dose",
+
                 papier: "papier",
+
+                // Wichtig:
+                // "Tüte" wird durch _normalize() zu "tute".
+                // Deshalb müssen sowohl "tute" als auch "tuete" auf dasselbe Konzept zeigen.
+                tute: "tuete",
                 tuete: "tuete",
+                beutel: "tuete",
+
                 verpackung: "verpackung",
+                verpackungen: "verpackung",
+
                 ladestation: "ladestation",
+                basis: "ladestation",
+
                 stein: "stein",
+                steine: "stein",
+
                 baum: "baum",
+                baeume: "baum",
+                baume: "baum",
+
                 mensch: "mensch",
-                tier: "tier"
+                menschen: "mensch",
+
+                tier: "tier",
+                tiere: "tier",
+
+                muell: "muell",
+                mull: "muell"
             };
 
             if (directMap[label]) {

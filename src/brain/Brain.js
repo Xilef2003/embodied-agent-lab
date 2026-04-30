@@ -5,11 +5,17 @@ import { GoalSystem } from "./GoalSystem.js";
 import { Planner } from "./Planner.js";
 import { LearningSystem } from "./LearningSystem.js";
 import { SemanticMemory } from "./SemanticMemory.js";
+import { ExperienceLearner } from "./ExperienceLearner.js";
+import { ExperienceSummary } from "./ExperienceSummary.js";
+import { UtilityEvaluator } from "./UtilityEvaluator.js";
 
 export class Brain {
     constructor(worldWidth, worldHeight) {
         this.worldModel = new WorldModel(worldWidth, worldHeight);
         this.semanticMemory = new SemanticMemory();
+        this.experienceLearner = new ExperienceLearner();
+        this.experienceSummary = new ExperienceSummary();
+        this.utilityEvaluator = new UtilityEvaluator();
 
         this.needSystem = new NeedSystem();
         this.emotionSystem = new EmotionSystem();
@@ -22,17 +28,26 @@ export class Brain {
             emotions: {},
             goal: null,
             action: null,
-            semantic: null
+            semantic: null,
+            experience: null,
+            experienceSummary: null
         };
     }
 
     decide(robot, observation) {
         this.worldModel.update(observation);
 
-        const semantic = this.semanticMemory.evaluateObservation(
+        const rawSemantic = this.semanticMemory.evaluateObservation(
             observation,
             this.worldModel,
             robot
+        );
+
+        const semantic = this.utilityEvaluator.evaluate(
+            rawSemantic,
+            robot,
+            this.worldModel,
+            this.experienceSummary
         );
 
         const learningState = this.learningSystem.getState();
@@ -57,6 +72,7 @@ export class Brain {
         );
 
         this.current = {
+            ...this.current,
             needs,
             emotions,
             goal,
@@ -68,26 +84,89 @@ export class Brain {
     }
 
     learn(action, result, observation, robot) {
+        const experienceEvents = this.experienceLearner.learn(
+            action,
+            result,
+            observation,
+            robot,
+            this.worldModel,
+            this.semanticMemory
+        );
+
+        const summaryEvents = this.experienceSummary.ingestEvents(
+            experienceEvents,
+            this.semanticMemory
+        );
+
         this.worldModel.integrateActionResult(action, result);
-        return this.learningSystem.learn(action, result, observation, robot);
+
+        const episode = this.learningSystem.learn(
+            action,
+            result,
+            observation,
+            robot
+        );
+
+        this.current = {
+            ...this.current,
+            experience: this.experienceLearner.getState(),
+            experienceSummary: this.experienceSummary.getState(this.semanticMemory)
+        };
+
+        return {
+            episode,
+            experienceEvents,
+            summaryEvents
+        };
     }
 
     explainConcept(concept) {
-        return this.semanticMemory.explainConcept(concept);
+        return {
+            semantic: this.semanticMemory.explainConcept(concept),
+            experience: this.experienceSummary.getProfile(concept)
+        };
     }
 
     getState() {
+        const experienceState = this.experienceLearner.getState();
+        const summaryState = this.experienceSummary.getState(this.semanticMemory);
+
+        const summaryLines = summaryState.recentEvents
+            .slice(-4)
+            .map(event => `[summary] ${event.message}`);
+
         return {
             ...this.current,
+
             learning: this.learningSystem.getState(),
+            experience: experienceState,
+            experienceSummary: summaryState,
+
             knownCellsRatio: this.worldModel.getKnownCellRatio(),
             knownTrashCount: this.worldModel.getKnownTrash().length,
+
             semanticCollectableCount: this.current.semantic?.collectableTargets?.length ?? 0,
             semanticHazardCount: this.current.semantic?.hazards?.length ?? 0,
             relationCount: this.current.semantic?.relationCount ?? 0,
             affordanceCount: this.current.semantic?.affordanceCount ?? 0,
+
+            utilityTopTarget: this.current.semantic?.utility?.topCollectableTarget ?? null,
+            utilityRankedTargets: this.current.semantic?.utility?.rankedCollectableTargets ?? [],
+            decisionExplanation: this.current.semantic?.utility?.decisionExplanation ?? null,
+
+            semanticEvents: this.current.semantic?.recentSemanticEvents ?? [],
+            experienceEventCount: experienceState.eventCount,
+            experienceConceptCount: summaryState.conceptCount,
+            experienceProfiles: summaryState.profiles,
+            recentExperienceEvents: experienceState.recentEvents,
+            recentSummaryEvents: summaryState.recentEvents,
+
             homeKnown: Boolean(this.worldModel.home),
-            recentLogLines: this.learningSystem.getRecentLogLines(12)
+
+            recentLogLines: [
+                ...this.learningSystem.getRecentLogLines(8),
+                ...summaryLines
+            ]
         };
     }
 }

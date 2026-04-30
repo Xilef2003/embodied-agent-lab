@@ -2,11 +2,12 @@ import { ACTION, GOAL } from "../config.js";
 import { keyOf, manhattan, neighbors4 } from "../utils/Grid.js";
 
 /**
- * Planner v0.5
+ * Planner v1.0
  *
  * Neu:
- * - COLLECT_TRASH nutzt semantisch sammelbare Ziele aus SemanticMemory
- * - Log sagt jetzt, welches Objekt aus welchem semantischen Grund angesteuert wird
+ * - Safety-Planning berücksichtigt Goal-Commitment.
+ * - AVOID maximiert Abstand zu allen nahen Risiken.
+ * - COLLECT_TRASH nutzt weiterhin Utility-Ziel aus GoalSystem.
  */
 export class Planner {
     constructor() {
@@ -31,11 +32,11 @@ export class Planner {
                 break;
 
             case GOAL.COLLECT_TRASH:
-                action = this._planCollectTrash(worldModel, robot, semantic);
+                action = this._planCollectTrash(goal, worldModel, robot, semantic);
                 break;
 
             case GOAL.AVOID:
-                action = this._planAvoid(worldModel, robot, semantic);
+                action = this._planAvoid(goal, worldModel, robot, semantic);
                 break;
 
             case GOAL.RETURN_HOME:
@@ -117,9 +118,16 @@ export class Planner {
         };
     }
 
-    _planCollectTrash(worldModel, robot, semantic = null) {
-        const semanticTarget = semantic?.collectableTargets?.[0] || null;
-        const target = semanticTarget?.entity || worldModel.getNearestKnownTrash(robot.position);
+    _planCollectTrash(goal, worldModel, robot, semantic = null) {
+        const semanticTarget =
+            semantic?.collectableTargets?.find(item => item.entity.id === goal.targetId) ||
+            semantic?.collectableTargets?.[0] ||
+            null;
+
+        const target =
+            semanticTarget?.entity ||
+            (goal.targetId ? worldModel.knownEntities.get(goal.targetId) : null) ||
+            worldModel.getNearestKnownTrash(robot.position);
 
         if (!target) {
             return {
@@ -130,7 +138,7 @@ export class Planner {
 
         if (manhattan(robot, target) <= 1) {
             const semanticReason = semanticTarget
-                ? `${semanticTarget.label} ist '${semanticTarget.concept}' mit Affordance collect.`
+                ? `${semanticTarget.label} ist '${semanticTarget.concept}' mit Utility ${semanticTarget.utility?.scorePercent ?? "?"}%.`
                 : `${target.label} ist als Müll markiert.`;
 
             return {
@@ -141,36 +149,67 @@ export class Planner {
         }
 
         const reason = semanticTarget
-            ? `${target.label} ansteuern. Semantik: ${semanticTarget.concept} -> collect.`
+            ? `${target.label} ansteuern. Utility: ${semanticTarget.utility?.explanation || "unbekannt"}.`
             : `${target.label} ansteuern.`;
 
         return this._moveToward(robot, target, worldModel, reason);
     }
 
-    _planAvoid(worldModel, robot, semantic = null) {
-        const semanticHazard = semantic?.hazards?.find(item => item.distance <= 2) || null;
-        const hazards = worldModel.getKnownHazards(robot.position, 2);
-        const hazard = semanticHazard?.entity || hazards[0];
+    _planAvoid(goal, worldModel, robot, semantic = null) {
+        const safeDistance = goal.safeDistance ?? 3;
 
-        if (!hazard) {
+        const semanticHazards = semantic?.hazards || [];
+        const relevantSemanticHazards = semanticHazards
+            .filter(item => item.distance < safeDistance + 1);
+
+        const fallbackHazards = worldModel.getKnownHazards(robot.position, safeDistance + 1)
+            .map(entity => ({
+                id: entity.id,
+                label: entity.label,
+                entity,
+                distance: manhattan(robot.position, entity),
+                concept: entity.type
+            }));
+
+        const hazards = relevantSemanticHazards.length > 0
+            ? relevantSemanticHazards
+            : fallbackHazards;
+
+        if (hazards.length === 0) {
             return {
                 type: ACTION.SCAN,
                 reason: "Risiko nicht mehr sichtbar, scanne neu."
             };
         }
 
+        const primaryHazard =
+            hazards.find(item => item.id === goal.hazardId) ||
+            hazards[0];
+
+        const currentMinDistance = this._minDistanceToHazards(robot.position, hazards);
+
         const candidates = neighbors4(robot.x, robot.y)
             .filter(cell => this._isUsableCell(cell, worldModel))
-            .map(cell => ({
-                ...cell,
-                distanceFromHazard: manhattan(cell, hazard),
-                revisitPenalty: this._recentVisitPenalty(cell)
-            }))
-            .sort((a, b) => {
-                const hazardDiff = b.distanceFromHazard - a.distanceFromHazard;
-                if (hazardDiff !== 0) return hazardDiff;
-                return a.revisitPenalty - b.revisitPenalty;
-            });
+            .map(cell => {
+                const minDistanceToHazards = this._minDistanceToHazards(cell, hazards);
+                const distanceToPrimary = manhattan(cell, primaryHazard.entity || primaryHazard);
+                const revisitPenalty = this._recentVisitPenalty(cell);
+                const improvement = minDistanceToHazards - currentMinDistance;
+
+                return {
+                    ...cell,
+                    minDistanceToHazards,
+                    distanceToPrimary,
+                    revisitPenalty,
+                    improvement,
+                    score:
+                        minDistanceToHazards * 3 +
+                        distanceToPrimary * 1.2 +
+                        improvement * 2 -
+                        revisitPenalty
+                };
+            })
+            .sort((a, b) => b.score - a.score);
 
         const best = candidates[0];
 
@@ -181,15 +220,18 @@ export class Planner {
             };
         }
 
-        const semanticText = semanticHazard
-            ? ` Semantik: ${semanticHazard.concept} -> keep_distance.`
-            : "";
+        const hazardNames = hazards
+            .slice(0, 3)
+            .map(item => item.label || item.concept || "Risiko")
+            .join(", ");
 
         return {
             type: ACTION.MOVE,
             dx: best.x - robot.x,
             dy: best.y - robot.y,
-            reason: `Von Risiko ${hazard.label} entfernen.${semanticText}`
+            reason:
+                `Sicherheitsabstand erhöhen. Risiken: ${hazardNames}. ` +
+                `Abstand ${currentMinDistance} -> ${best.minDistanceToHazards}.`
         };
     }
 
@@ -334,6 +376,14 @@ export class Planner {
             .sort((a, b) => a.score - b.score);
 
         return candidates[0] || null;
+    }
+
+    _minDistanceToHazards(position, hazards) {
+        if (!hazards || hazards.length === 0) return Infinity;
+
+        return Math.min(
+            ...hazards.map(item => manhattan(position, item.entity || item))
+        );
     }
 
     _isUsableCell(cell, worldModel) {
