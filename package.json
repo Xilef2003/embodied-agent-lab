@@ -1,0 +1,10 @@
+{
+  "name": "embodied-agent-lab",
+  "version": "0.3.0",
+  "description": "Embodied Agent Lab mit BFS, Anti-Ping-Pong und Goal-Commitment für stabileres Laden/Entladen.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "MIT"
+}
