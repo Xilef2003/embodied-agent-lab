@@ -12,6 +12,15 @@ export const CONFIG = {
 
     robotTrashCapacity: 6,
 
+    // v1.2: dynamische Welt
+    maxTrashCount: 38,
+    dynamicTrashSpawnChance: 0.025,
+    heavyTrashChance: 0.18,
+
+    // v1.2: soziale Störung / Safety-Test
+    humanShoveChance: 0.12,
+    disruptiveHumanChance: 0.35,
+
     initialSeed: 42
 };
 
@@ -29,7 +38,8 @@ export const ACTION = Object.freeze({
     CHARGE: "charge",
     EMPTY: "empty",
     SCAN: "scan",
-    IDLE: "idle"
+    IDLE: "idle",
+    RECOVER: "recover"
 });
 
 export const GOAL = Object.freeze({
@@ -40,9 +50,5 @@ export const GOAL = Object.freeze({
     AVOID: "avoid",
     RETURN_HOME: "return_home",
     STANDBY: "standby",
-
-    // v1.1:
-    // Der Agent kehrt bewusst in eine interessante Region zurück,
-    // weil dort historisch Müll/Risiken/Unsicherheit beobachtet wurden.
     PATROL_AREA: "patrol_area"
 });

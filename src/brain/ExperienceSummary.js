@@ -42,6 +42,35 @@ export class ExperienceSummary {
                     profile.tags.add("difficult_to_grasp");
                     break;
 
+                case "grip_failure":
+                    profile.pickupFailure++;
+                    profile.pickupAttempts++;
+                    profile.gripFailures++;
+                    profile.negativeEvidence++;
+                    profile.tags.add("difficult_to_grasp");
+                    profile.tags.add("grip_unreliable");
+                    break;
+
+                case "physical_limit_too_heavy":
+                    profile.pickupFailure++;
+                    profile.pickupAttempts++;
+                    profile.tooHeavyFailures++;
+                    profile.negativeEvidence += 2;
+                    profile.tags.add("too_heavy");
+                    profile.tags.add("physical_limit");
+                    profile.tags.add("difficult_to_grasp");
+                    break;
+
+                case "physical_limit_too_large":
+                    profile.pickupFailure++;
+                    profile.pickupAttempts++;
+                    profile.tooLargeFailures++;
+                    profile.negativeEvidence += 2;
+                    profile.tags.add("too_large");
+                    profile.tags.add("physical_limit");
+                    profile.tags.add("difficult_to_grasp");
+                    break;
+
                 case "blocked_movement":
                     profile.blockedMovement++;
                     profile.positiveEvidence++;
@@ -88,6 +117,7 @@ export class ExperienceSummary {
             );
 
             profile.reliability = this._computeReliability(profile);
+            profile.profileType = this._determineProfileType(profile);
             profile.summary = this._makeProfileSummary(profile);
 
             const summaryEvent = {
@@ -130,6 +160,7 @@ export class ExperienceSummary {
                     profile.concept,
                     semanticMemory
                 );
+                profile.profileType = this._determineProfileType(profile);
                 profile.summary = this._makeProfileSummary(profile);
             }
         }
@@ -148,12 +179,17 @@ export class ExperienceSummary {
         if (!this.concepts.has(key)) {
             this.concepts.set(key, {
                 concept: key,
+                profileType: "general",
                 totalEvents: 0,
 
                 pickupAttempts: 0,
                 pickupSuccess: 0,
                 pickupFailure: 0,
                 pickupSuccessRate: null,
+
+                gripFailures: 0,
+                tooHeavyFailures: 0,
+                tooLargeFailures: 0,
 
                 blockedMovement: 0,
                 safetyEvents: 0,
@@ -182,12 +218,17 @@ export class ExperienceSummary {
     _publicProfile(profile) {
         return {
             concept: profile.concept,
+            profileType: profile.profileType,
             totalEvents: profile.totalEvents,
 
             pickupAttempts: profile.pickupAttempts,
             pickupSuccess: profile.pickupSuccess,
             pickupFailure: profile.pickupFailure,
             pickupSuccessRate: profile.pickupSuccessRate,
+
+            gripFailures: profile.gripFailures,
+            tooHeavyFailures: profile.tooHeavyFailures,
+            tooLargeFailures: profile.tooLargeFailures,
 
             blockedMovement: profile.blockedMovement,
             safetyEvents: profile.safetyEvents,
@@ -208,11 +249,38 @@ export class ExperienceSummary {
         };
     }
 
+    _determineProfileType(profile) {
+        if (profile.tooHeavyFailures > 0 || profile.tooLargeFailures > 0) {
+            return "physical_limit";
+        }
+
+        if (profile.pickupAttempts > 0) {
+            return "pickup";
+        }
+
+        if (profile.chargeSuccess > 0 || profile.emptySuccess > 0) {
+            return "utility";
+        }
+
+        if (profile.safetyEvents > 0) {
+            return "safety";
+        }
+
+        if (profile.blockedMovement > 0) {
+            return "obstacle";
+        }
+
+        return "general";
+    }
+
     _profileImportance(profile) {
         return (
             profile.totalEvents * 1.0 +
             profile.pickupSuccess * 2.0 +
-            profile.pickupFailure * 1.5 +
+            profile.pickupFailure * 1.8 +
+            profile.tooHeavyFailures * 2.5 +
+            profile.tooLargeFailures * 2.5 +
+            profile.gripFailures * 1.8 +
             profile.blockedMovement * 1.4 +
             profile.safetyEvents * 1.8 +
             profile.chargeSuccess * 0.5 +
@@ -234,7 +302,17 @@ export class ExperienceSummary {
     _makeProfileSummary(profile) {
         const parts = [];
 
-        if (profile.pickupAttempts > 0) {
+        if (profile.profileType === "utility") {
+            parts.push(`${profile.concept}: Nutzungs-Erfahrung`);
+
+            if (profile.chargeSuccess > 0) {
+                parts.push(`${profile.chargeSuccess}x erfolgreich geladen`);
+            }
+
+            if (profile.emptySuccess > 0) {
+                parts.push(`${profile.emptySuccess}x erfolgreich entladen`);
+            }
+        } else if (profile.pickupAttempts > 0) {
             const rate = Math.round((profile.pickupSuccessRate || 0) * 100);
             parts.push(
                 `${profile.concept}: ${profile.pickupSuccess}/${profile.pickupAttempts} Pickups erfolgreich (${rate}%)`
@@ -243,20 +321,24 @@ export class ExperienceSummary {
             parts.push(`${profile.concept}: ${profile.totalEvents} Ereignisse`);
         }
 
+        if (profile.tooHeavyFailures > 0) {
+            parts.push(`${profile.tooHeavyFailures}x zu schwer`);
+        }
+
+        if (profile.tooLargeFailures > 0) {
+            parts.push(`${profile.tooLargeFailures}x zu groß`);
+        }
+
+        if (profile.gripFailures > 0) {
+            parts.push(`${profile.gripFailures}x entglitten`);
+        }
+
         if (profile.blockedMovement > 0) {
             parts.push(`${profile.blockedMovement}x Weg blockiert`);
         }
 
         if (profile.safetyEvents > 0) {
             parts.push(`${profile.safetyEvents}x Sicherheitsrelevanz`);
-        }
-
-        if (profile.chargeSuccess > 0) {
-            parts.push(`${profile.chargeSuccess}x erfolgreich geladen`);
-        }
-
-        if (profile.emptySuccess > 0) {
-            parts.push(`${profile.emptySuccess}x erfolgreich entladen`);
         }
 
         const confidenceParts = [];
@@ -268,7 +350,7 @@ export class ExperienceSummary {
         }
 
         if (confidenceParts.length > 0) {
-            parts.push(confidenceParts.slice(0, 3).join(", "));
+            parts.push(confidenceParts.slice(0, 4).join(", "));
         }
 
         return parts.join(" | ");

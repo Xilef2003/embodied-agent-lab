@@ -3,11 +3,15 @@ import { manhattan } from "../utils/Grid.js";
 
 export class Actions {
     static execute(robot, world, action) {
+        if (robot.body.isKnockedDown && action?.type !== ACTION.RECOVER) {
+            return Actions._recover(robot, "Roboter ist umgefallen und muss sich zuerst aufrichten.");
+        }
+
         if (!action || !action.type) {
             return Actions._idle(robot, "Keine Aktion gewählt.");
         }
 
-        if (robot.body.battery <= 0 && action.type !== ACTION.CHARGE) {
+        if (robot.body.battery <= 0 && action.type !== ACTION.CHARGE && action.type !== ACTION.RECOVER) {
             robot.body.recordFailure();
             return {
                 ok: false,
@@ -32,6 +36,9 @@ export class Actions {
             case ACTION.SCAN:
                 return Actions._scan(robot);
 
+            case ACTION.RECOVER:
+                return Actions._recover(robot, action.reason || "Roboter richtet sich auf.");
+
             case ACTION.IDLE:
             default:
                 return Actions._idle(robot, action.reason || "Warten.");
@@ -45,9 +52,11 @@ export class Actions {
         const nextY = robot.y + dy;
 
         robot.body.drain(0.42);
+        robot.body.stabilize(0.25);
 
         if (Math.abs(dx) + Math.abs(dy) !== 1) {
             robot.body.recordFailure();
+
             return {
                 ok: false,
                 type: ACTION.MOVE,
@@ -58,6 +67,7 @@ export class Actions {
 
         if (!world.isInside(nextX, nextY)) {
             robot.body.recordFailure();
+
             return {
                 ok: false,
                 type: ACTION.MOVE,
@@ -69,6 +79,7 @@ export class Actions {
         if (world.isBlocked(nextX, nextY)) {
             robot.body.recordFailure();
             robot.body.damage(0.15);
+            robot.body.destabilize(4);
 
             const blocker = world.entitiesAt(nextX, nextY).find(entity =>
                 entity.type === ENTITY.OBSTACLE ||
@@ -79,7 +90,7 @@ export class Actions {
             return {
                 ok: false,
                 type: ACTION.MOVE,
-                message: `Blockiert durch ${blocker?.label || "Hindernis"}.`,
+                message: `Blockiert durch ${blocker?.label || blocker?.props?.label || "Hindernis"}.`,
                 blockedCell: { x: nextX, y: nextY },
                 blocker: blocker?.clonePublic() || null
             };
@@ -101,6 +112,7 @@ export class Actions {
 
         if (robot.body.isLoadFull) {
             robot.body.recordFailure();
+
             return {
                 ok: false,
                 type: ACTION.PICKUP,
@@ -118,6 +130,7 @@ export class Actions {
 
         if (!target || target.type !== ENTITY.TRASH) {
             robot.body.recordFailure();
+
             return {
                 ok: false,
                 type: ACTION.PICKUP,
@@ -127,6 +140,7 @@ export class Actions {
 
         if (manhattan(robot, target) > 1) {
             robot.body.recordFailure();
+
             return {
                 ok: false,
                 type: ACTION.PICKUP,
@@ -135,16 +149,74 @@ export class Actions {
             };
         }
 
+        const weightKg = Number(target.props?.weightKg ?? 0.1);
+        const sizeUnits = Number(target.props?.sizeUnits ?? 1);
+        const gripDifficulty = Number(target.props?.gripDifficulty ?? 0.15);
+
+        if (!robot.body.canLift(weightKg)) {
+            robot.body.recordFailedPickup();
+            robot.body.destabilize(6);
+
+            return {
+                ok: false,
+                type: ACTION.PICKUP,
+                failureReason: "too_heavy",
+                message:
+                    `${target.label || target.props?.label || "Objekt"} ist zu schwer ` +
+                    `(${weightKg}kg > Traglimit ${robot.body.maxLiftWeight}kg).`,
+                target: target.clonePublic()
+            };
+        }
+
+        if (!robot.body.canGrip(sizeUnits)) {
+            robot.body.recordFailedPickup();
+            robot.body.destabilize(4);
+
+            return {
+                ok: false,
+                type: ACTION.PICKUP,
+                failureReason: "too_large",
+                message:
+                    `${target.label || target.props?.label || "Objekt"} ist zu groß für den Greifer ` +
+                    `(Größe ${sizeUnits} > Limit ${robot.body.maxGripSize}).`,
+                target: target.clonePublic()
+            };
+        }
+
+        const weightBonus = clamp((robot.body.maxLiftWeight - weightKg) * 0.04, 0, 0.16);
+        const sizeBonus = clamp((robot.body.maxGripSize - sizeUnits) * 0.03, 0, 0.12);
+        const successChance = clamp(1 - gripDifficulty + weightBonus + sizeBonus, 0.12, 0.98);
+
+        if (Math.random() > successChance) {
+            robot.body.recordFailedPickup();
+            robot.body.destabilize(3);
+
+            return {
+                ok: false,
+                type: ACTION.PICKUP,
+                failureReason: "grip_failed",
+                message:
+                    `${target.label || target.props?.label || "Objekt"} ist beim Greifen entglitten ` +
+                    `(Greifchance ${Math.round(successChance * 100)}%).`,
+                target: target.clonePublic()
+            };
+        }
+
+        const collectedTarget = target.clonePublic();
+
         world.removeEntity(target.id);
         robot.body.trashLoad++;
         robot.body.totalCollected++;
+        robot.body.stabilize(1);
         robot.body.recordSuccess();
 
         return {
             ok: true,
             type: ACTION.PICKUP,
-            message: `${target.label} eingesammelt.`,
-            target: target.clonePublic()
+            message:
+                `${collectedTarget.label || collectedTarget.props?.label || "Objekt"} eingesammelt ` +
+                `(${weightKg}kg, Größe ${sizeUnits}).`,
+            target: collectedTarget
         };
     }
 
@@ -154,6 +226,7 @@ export class Actions {
         if (!charger || manhattan(robot, charger) > 0) {
             robot.body.drain(0.08);
             robot.body.recordFailure();
+
             return {
                 ok: false,
                 type: ACTION.CHARGE,
@@ -162,6 +235,7 @@ export class Actions {
         }
 
         robot.body.charge(4.8);
+        robot.body.stabilize(1.5);
         robot.body.recordSuccess();
 
         return {
@@ -177,6 +251,7 @@ export class Actions {
         if (!charger || manhattan(robot, charger) > 0) {
             robot.body.drain(0.08);
             robot.body.recordFailure();
+
             return {
                 ok: false,
                 type: ACTION.EMPTY,
@@ -188,25 +263,29 @@ export class Actions {
             return {
                 ok: true,
                 type: ACTION.EMPTY,
+                emptied: 0,
                 message: "Behälter ist bereits leer."
             };
         }
 
         const emptied = robot.body.trashLoad;
+
         robot.body.trashLoad = 0;
         robot.body.totalEmptied += emptied;
+        robot.body.stabilize(3);
         robot.body.recordSuccess();
 
         return {
             ok: true,
             type: ACTION.EMPTY,
-            message: `${emptied} Müllobjekte an der Basis abgegeben.`,
-            emptied
+            emptied,
+            message: `${emptied} Müllobjekte an der Basis abgegeben.`
         };
     }
 
     static _scan(robot) {
         robot.body.drain(0.12);
+        robot.body.stabilize(0.5);
         robot.body.recordSuccess();
 
         return {
@@ -216,8 +295,23 @@ export class Actions {
         };
     }
 
+    static _recover(robot, reason) {
+        robot.body.drain(0.35);
+
+        const recovered = robot.body.recoverStep();
+
+        return {
+            ok: recovered,
+            type: ACTION.RECOVER,
+            message: recovered
+                ? "Roboter hat sich wieder aufgerichtet."
+                : `${reason} Recovery läuft noch (${robot.body.recoveryTicksRemaining} Tick(s)).`
+        };
+    }
+
     static _idle(robot, reason) {
         robot.body.drain(0.05);
+        robot.body.stabilize(0.4);
 
         return {
             ok: true,
@@ -225,4 +319,8 @@ export class Actions {
             message: reason
         };
     }
+}
+
+function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
 }

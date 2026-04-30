@@ -5,7 +5,8 @@ export class LearningSystem {
             successes: 0,
             failures: 0,
             collectedTrash: 0,
-            emptiedTrash: 0
+            emptiedTrash: 0,
+            externalEvents: 0
         };
 
         this.recentWindow = [];
@@ -22,7 +23,7 @@ export class LearningSystem {
         };
 
         this.episodes.push(episode);
-        if (this.episodes.length > 120) this.episodes.shift();
+        if (this.episodes.length > 160) this.episodes.shift();
 
         this.recentWindow.push(Boolean(result?.ok));
         if (this.recentWindow.length > 12) this.recentWindow.shift();
@@ -44,6 +45,30 @@ export class LearningSystem {
         return episode;
     }
 
+    recordExternalEvent(event) {
+        if (!event) return;
+
+        const episode = {
+            step: event.step,
+            external: true,
+            event
+        };
+
+        this.episodes.push(episode);
+        if (this.episodes.length > 160) this.episodes.shift();
+
+        this.stats.externalEvents++;
+
+        if (event.impact === "negative") {
+            this.stats.failures++;
+            this.recentWindow.push(false);
+        } else {
+            this.recentWindow.push(true);
+        }
+
+        if (this.recentWindow.length > 12) this.recentWindow.shift();
+    }
+
     getState() {
         const recentFailures = this.recentWindow.filter(ok => !ok).length;
         const recentSuccesses = this.recentWindow.filter(Boolean).length;
@@ -59,8 +84,13 @@ export class LearningSystem {
 
     getRecentLogLines(limit = 10) {
         return this.episodes.slice(-limit).map(episode => {
+            if (episode.external) {
+                const prefix = episode.event.impact === "negative" ? "ENV!" : "ENV";
+                return `[${episode.step}] ${prefix}: ${episode.event.message}`;
+            }
+
             const status = episode.result?.ok ? "OK" : "FAIL";
-            const action = episode.action?.type || "none";
+            const action = episode.result?.type || episode.action?.type || "none";
             const reason = episode.action?.reason || "";
             const message = episode.result?.message || "";
 

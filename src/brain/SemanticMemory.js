@@ -16,11 +16,11 @@ export class SemanticMemory {
         const ancestors = this.relations.getAncestors(concept);
 
         const allConcepts = [concept, ...ancestors];
-
         const affordances = this._collectInheritedAffordances(allConcepts);
 
         const collectable = affordances.some(item => item.affordance === "collect");
         const chargeable = affordances.some(item => item.affordance === "charge");
+
         const shouldAvoid = affordances.some(item =>
             item.affordance === "avoid" ||
             item.affordance === "keep_distance"
@@ -29,11 +29,26 @@ export class SemanticMemory {
         const graspable = affordances.some(item => item.affordance === "grasp");
         const obstacleLike = affordances.some(item => item.affordance === "blocks_path");
 
+        const tooHeavy = affordances.some(item =>
+            item.affordance === "too_heavy" &&
+            item.confidence >= 0.55
+        );
+
+        const tooLarge = affordances.some(item =>
+            item.affordance === "too_large" &&
+            item.confidence >= 0.55
+        );
+
+        const difficultToGrasp = affordances.some(item =>
+            item.affordance === "difficult_to_grasp" &&
+            item.confidence >= 0.55
+        );
+
         return {
             id: entity.id,
             entity,
             concept,
-            label: entity.label || concept,
+            label: entity.label || entity.props?.label || concept,
             type: entity.type,
             ancestors,
             affordances,
@@ -42,6 +57,9 @@ export class SemanticMemory {
             shouldAvoid,
             graspable,
             obstacleLike,
+            tooHeavy,
+            tooLarge,
+            difficultToGrasp,
             distance: robotPosition ? manhattan(robotPosition, entity) : entity.distance ?? Infinity,
             explanation: this.explainConcept(concept)
         };
@@ -131,7 +149,7 @@ export class SemanticMemory {
     }
 
     entityToConcept(entity) {
-        const label = this._normalize(entity.label || "");
+        const label = this._normalize(entity.label || entity.props?.label || "");
 
         if (label) {
             const directMap = {
@@ -143,15 +161,25 @@ export class SemanticMemory {
 
                 papier: "papier",
 
-                // Wichtig:
-                // "Tüte" wird durch _normalize() zu "tute".
-                // Deshalb müssen sowohl "tute" als auch "tuete" auf dasselbe Konzept zeigen.
                 tute: "tuete",
                 tuete: "tuete",
                 beutel: "tuete",
 
                 verpackung: "verpackung",
                 verpackungen: "verpackung",
+
+                metallteil: "metallteil",
+                metall_stueck: "metallteil",
+                metallstueck: "metallteil",
+                metallstuck: "metallteil",
+
+                holzbrett: "holzbrett",
+                brett: "holzbrett",
+
+                grosser_sack: "grosser_sack",
+                grosser_sack_: "grosser_sack",
+                grosser: "grosser_sack",
+                sack: "grosser_sack",
 
                 ladestation: "ladestation",
                 basis: "ladestation",
@@ -165,6 +193,8 @@ export class SemanticMemory {
 
                 mensch: "mensch",
                 menschen: "mensch",
+                stoerperson: "mensch",
+                storperson: "mensch",
 
                 tier: "tier",
                 tiere: "tier",
@@ -212,12 +242,19 @@ export class SemanticMemory {
     }
 
     _seedBaseKnowledge() {
-        // Taxonomie
+        // Taxonomie: normaler Müll
         this.relations.addRelation("plastikflasche", "is_a", "muell", 0.98, "seed");
         this.relations.addRelation("dose", "is_a", "muell", 0.98, "seed");
         this.relations.addRelation("papier", "is_a", "muell", 0.92, "seed");
         this.relations.addRelation("tuete", "is_a", "muell", 0.96, "seed");
         this.relations.addRelation("verpackung", "is_a", "muell", 0.95, "seed");
+
+        // v1.3: physisch schwieriger Müll
+        this.relations.addRelation("metallteil", "is_a", "schweres_objekt", 0.9, "seed");
+        this.relations.addRelation("holzbrett", "is_a", "sperriges_objekt", 0.9, "seed");
+        this.relations.addRelation("grosser_sack", "is_a", "schweres_objekt", 0.85, "seed");
+        this.relations.addRelation("schweres_objekt", "is_a", "muell", 0.75, "seed");
+        this.relations.addRelation("sperriges_objekt", "is_a", "muell", 0.75, "seed");
 
         this.relations.addRelation("stein", "is_a", "natur_objekt", 0.95, "seed");
         this.relations.addRelation("baum", "is_a", "natur_objekt", 0.95, "seed");
@@ -227,30 +264,42 @@ export class SemanticMemory {
 
         this.relations.addRelation("ladestation", "is_a", "energiequelle", 1, "seed");
 
-        // Zweck- und Bedeutungsrelationen
+        // Zweckrelationen
         this.relations.addRelation("muell", "belongs_in", "sammelbehaelter", 0.95, "seed");
         this.relations.addRelation("roboter", "has_need", "energie", 1, "seed");
         this.relations.addRelation("akku_niedrig", "requires", "ladestation", 1, "seed");
         this.relations.addRelation("sammelbehaelter_voll", "requires", "basis", 1, "seed");
         this.relations.addRelation("lebewesen", "requires", "sicherheitsabstand", 1, "seed");
 
-        // Affordances: Was kann/soll man mit Dingen tun?
+        // Allgemeiner Müll
         this.affordances.addAffordance("muell", "collect", 0.95, "Müll soll eingesammelt werden.");
         this.affordances.addAffordance("muell", "dispose", 0.95, "Müll gehört in den Sammelbehälter.");
 
+        // Normale Greifbarkeit
         this.affordances.addAffordance("plastikflasche", "grasp", 0.9, "Flaschen sind meist greifbar.");
         this.affordances.addAffordance("dose", "grasp", 0.88, "Dosen sind meist greifbar.");
         this.affordances.addAffordance("papier", "grasp", 0.65, "Papier kann gegriffen werden, ist aber flach.");
         this.affordances.addAffordance("tuete", "grasp", 0.72, "Tüten sind greifbar, aber flexibel.");
         this.affordances.addAffordance("verpackung", "grasp", 0.8, "Verpackungen sind meist greifbar.");
 
+        // v1.3: physische Warnsignale
+        this.affordances.addAffordance("schweres_objekt", "difficult_to_grasp", 0.55, "Schwere Objekte sind für kleine Greifer schwierig.");
+        this.affordances.addAffordance("sperriges_objekt", "difficult_to_grasp", 0.6, "Sperrige Objekte sind schwer zu greifen.");
+        this.affordances.addAffordance("metallteil", "too_heavy", 0.45, "Metallteile können zu schwer sein.");
+        this.affordances.addAffordance("holzbrett", "too_large", 0.5, "Holzbretter können zu sperrig sein.");
+        this.affordances.addAffordance("grosser_sack", "too_heavy", 0.45, "Große Säcke können zu schwer sein.");
+        this.affordances.addAffordance("grosser_sack", "too_large", 0.5, "Große Säcke können zu sperrig sein.");
+
+        // Ladestation / Basis
         this.affordances.addAffordance("ladestation", "charge", 1, "Die Ladestation lädt den Akku.");
         this.affordances.addAffordance("ladestation", "return_home", 1, "Die Ladestation ist die Basis.");
 
+        // Hindernisse
         this.affordances.addAffordance("stein", "blocks_path", 0.8, "Steine können Wege blockieren.");
         this.affordances.addAffordance("baum", "blocks_path", 0.95, "Bäume blockieren Wege.");
         this.affordances.addAffordance("hindernis", "blocks_path", 1, "Hindernisse blockieren Wege.");
 
+        // Lebewesen
         this.affordances.addAffordance("mensch", "keep_distance", 1, "Menschen dürfen nicht gefährdet werden.");
         this.affordances.addAffordance("tier", "keep_distance", 1, "Tiere sollen nicht gestört werden.");
         this.affordances.addAffordance("lebewesen", "avoid", 0.85, "Lebewesen haben Sicherheitspriorität.");

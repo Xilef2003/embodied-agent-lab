@@ -5,6 +5,7 @@ export class ExperienceLearner {
         this.config = {
             positiveLearningRate: 0.07,
             negativeLearningRate: 0.04,
+            physicalLimitLearningRate: 0.16,
             relationConfidenceFromExperience: 0.72,
             maxEvents: 120,
             ...options
@@ -83,6 +84,14 @@ export class ExperienceLearner {
             "Greifen war erfolgreich."
         );
 
+        // Erfolgreicher Pickup schwächt harte Negativannahmen leicht ab.
+        semanticMemory.weakenAffordance(
+            concept,
+            "difficult_to_grasp",
+            this.config.negativeLearningRate * 0.5,
+            "Trotz möglicher Schwierigkeit erfolgreich gegriffen."
+        );
+
         const collectAfter = semanticMemory.affordances.getConfidence(concept, "collect");
         const graspAfter = semanticMemory.affordances.getConfidence(concept, "grasp");
 
@@ -90,8 +99,8 @@ export class ExperienceLearner {
             kind: "pickup_success",
             concept,
             entityId: target.id,
-            label: target.label,
-            message: `${target.label} erfolgreich gesammelt: collect/grasp verstärkt.`,
+            label: target.label || target.props?.label,
+            message: `${target.label || target.props?.label || concept} erfolgreich gesammelt: collect/grasp verstärkt.`,
             confidenceChanges: [
                 {
                     affordance: "collect",
@@ -120,7 +129,7 @@ export class ExperienceLearner {
                 kind: "relation_learned",
                 concept,
                 entityId: target.id,
-                label: target.label,
+                label: target.label || target.props?.label,
                 message: `${concept} wurde durch Erfahrung als Müll klassifiziert.`
             });
         }
@@ -139,16 +148,22 @@ export class ExperienceLearner {
             return events;
         }
 
-        const target = action.targetId
-            ? worldModel.knownEntities.get(action.targetId)
-            : null;
+        const target =
+            result.target ||
+            (action.targetId ? worldModel.knownEntities.get(action.targetId) : null);
 
         if (!target) {
             return events;
         }
 
         const concept = semanticMemory.entityToConcept(target);
+        const label = target.label || target.props?.label || concept;
+        const failureReason = result.failureReason || "pickup_failed";
+
         const graspBefore = semanticMemory.affordances.getConfidence(concept, "grasp");
+        const difficultBefore = semanticMemory.affordances.getConfidence(concept, "difficult_to_grasp");
+        const tooHeavyBefore = semanticMemory.affordances.getConfidence(concept, "too_heavy");
+        const tooLargeBefore = semanticMemory.affordances.getConfidence(concept, "too_large");
 
         semanticMemory.weakenAffordance(
             concept,
@@ -157,19 +172,135 @@ export class ExperienceLearner {
             "Pickup ist fehlgeschlagen."
         );
 
-        const graspAfter = semanticMemory.affordances.getConfidence(concept, "grasp");
+        semanticMemory.reinforceAffordance(
+            concept,
+            "difficult_to_grasp",
+            this.config.negativeLearningRate,
+            "Pickup ist fehlgeschlagen."
+        );
+
+        if (failureReason === "too_heavy") {
+            semanticMemory.reinforceAffordance(
+                concept,
+                "too_heavy",
+                this.config.physicalLimitLearningRate,
+                "Objekt überschreitet Traglimit."
+            );
+
+            semanticMemory.reinforceAffordance(
+                concept,
+                "difficult_to_grasp",
+                this.config.physicalLimitLearningRate * 0.5,
+                "Zu schwer für stabilen Pickup."
+            );
+
+            events.push({
+                kind: "physical_limit_too_heavy",
+                concept,
+                entityId: target.id,
+                label,
+                message: `${label} war zu schwer: too_heavy/difficult_to_grasp verstärkt.`,
+                failureReason,
+                confidenceChanges: [
+                    {
+                        affordance: "too_heavy",
+                        before: tooHeavyBefore,
+                        after: semanticMemory.affordances.getConfidence(concept, "too_heavy")
+                    },
+                    {
+                        affordance: "grasp",
+                        before: graspBefore,
+                        after: semanticMemory.affordances.getConfidence(concept, "grasp")
+                    }
+                ]
+            });
+
+            return events;
+        }
+
+        if (failureReason === "too_large") {
+            semanticMemory.reinforceAffordance(
+                concept,
+                "too_large",
+                this.config.physicalLimitLearningRate,
+                "Objekt überschreitet Greifergröße."
+            );
+
+            semanticMemory.reinforceAffordance(
+                concept,
+                "difficult_to_grasp",
+                this.config.physicalLimitLearningRate * 0.5,
+                "Zu groß für stabilen Pickup."
+            );
+
+            events.push({
+                kind: "physical_limit_too_large",
+                concept,
+                entityId: target.id,
+                label,
+                message: `${label} war zu groß: too_large/difficult_to_grasp verstärkt.`,
+                failureReason,
+                confidenceChanges: [
+                    {
+                        affordance: "too_large",
+                        before: tooLargeBefore,
+                        after: semanticMemory.affordances.getConfidence(concept, "too_large")
+                    },
+                    {
+                        affordance: "grasp",
+                        before: graspBefore,
+                        after: semanticMemory.affordances.getConfidence(concept, "grasp")
+                    }
+                ]
+            });
+
+            return events;
+        }
+
+        if (failureReason === "grip_failed") {
+            semanticMemory.reinforceAffordance(
+                concept,
+                "difficult_to_grasp",
+                this.config.negativeLearningRate * 1.5,
+                "Objekt ist beim Greifen entglitten."
+            );
+
+            events.push({
+                kind: "grip_failure",
+                concept,
+                entityId: target.id,
+                label,
+                message: `${label} ist beim Greifen entglitten: difficult_to_grasp verstärkt.`,
+                failureReason,
+                confidenceChanges: [
+                    {
+                        affordance: "difficult_to_grasp",
+                        before: difficultBefore,
+                        after: semanticMemory.affordances.getConfidence(concept, "difficult_to_grasp")
+                    },
+                    {
+                        affordance: "grasp",
+                        before: graspBefore,
+                        after: semanticMemory.affordances.getConfidence(concept, "grasp")
+                    }
+                ]
+            });
+
+            return events;
+        }
 
         events.push({
             kind: "pickup_failure",
             concept,
             entityId: target.id,
-            label: target.label,
-            message: `Pickup bei ${target.label} fehlgeschlagen: grasp leicht abgeschwächt.`,
+            label,
+            message: `Pickup bei ${label} fehlgeschlagen: grasp abgeschwächt.`,
+            failureReason,
             confidenceChanges: [
                 {
                     affordance: "grasp",
                     before: graspBefore,
-                    after: graspAfter
+                    after: semanticMemory.affordances.getConfidence(concept, "grasp")
                 }
             ]
         });
@@ -196,8 +327,8 @@ export class ExperienceLearner {
             kind: "blocked_movement",
             concept,
             entityId: blocker.id,
-            label: blocker.label,
-            message: `${blocker.label} blockierte Bewegung: blocks_path verstärkt.`,
+            label: blocker.label || blocker.props?.label,
+            message: `${blocker.label || blocker.props?.label || concept} blockierte Bewegung: blocks_path verstärkt.`,
             confidenceChanges: [
                 {
                     affordance: "blocks_path",
@@ -232,8 +363,8 @@ export class ExperienceLearner {
                 kind: "safety_learning",
                 concept,
                 entityId: blocker.id,
-                label: blocker.label,
-                message: `${blocker.label}: keep_distance/avoid verstärkt.`,
+                label: blocker.label || blocker.props?.label,
+                message: `${blocker.label || blocker.props?.label || concept}: keep_distance/avoid verstärkt.`,
                 confidenceChanges: [
                     {
                         affordance: "keep_distance",

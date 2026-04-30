@@ -24,6 +24,16 @@ export class UtilityEvaluator {
             experienceSummary
         );
 
+        const actionableTargets = rankedCollectableTargets.filter(target =>
+            target.utility.isPhysicallyPossible &&
+            target.utility.score > 0.08
+        );
+
+        const uncollectableTargets = rankedCollectableTargets.filter(target =>
+            !target.utility.isPhysicallyPossible ||
+            target.utility.physical?.hardImpossible
+        );
+
         const decisionExplanation = this._makeDecisionExplanation(
             rankedCollectableTargets,
             robot,
@@ -33,14 +43,14 @@ export class UtilityEvaluator {
         return {
             ...semantic,
 
-            // Kompatibilität:
-            // GoalSystem und Planner nutzen weiterhin collectableTargets[0],
-            // aber die Liste ist jetzt nach strategischem Nutzen sortiert.
             collectableTargets: rankedCollectableTargets,
 
             utility: {
                 rankedCollectableTargets,
+                actionableTargets,
+                uncollectableTargets,
                 topCollectableTarget: rankedCollectableTargets[0] || null,
+                topActionableTarget: actionableTargets[0] || null,
                 decisionExplanation
             }
         };
@@ -77,10 +87,14 @@ export class UtilityEvaluator {
                 ? profile.pickupSuccessRate
                 : null;
 
-        const successScore =
+        const physical = this._physicalFeasibility(target, robot, profile);
+
+        const baseSuccessScore =
             pickupSuccessRate !== null
                 ? this._clamp(pickupSuccessRate * 0.65 + graspConfidence * 0.35)
                 : this._clamp(graspConfidence * 0.7 + collectConfidence * 0.3);
+
+        const successScore = this._clamp(baseSuccessScore - physical.successPenalty);
 
         const distanceScore = this._clamp(
             1 - distanceToTarget / this.config.maxUsefulDistance
@@ -103,7 +117,8 @@ export class UtilityEvaluator {
             learning: learningValue * 0.13,
             collect: collectConfidence * 0.08,
             risk: -riskPenalty,
-            load: -loadPenalty
+            load: -loadPenalty,
+            physical: -physical.penalty
         };
 
         const rawScore =
@@ -113,13 +128,17 @@ export class UtilityEvaluator {
             weighted.learning +
             weighted.collect +
             weighted.risk +
-            weighted.load;
+            weighted.load +
+            weighted.physical;
 
-        const score = this._clamp(rawScore);
+        const score = physical.hardImpossible
+            ? Math.min(0.08, this._clamp(rawScore))
+            : this._clamp(rawScore);
 
         const breakdown = this._makeBreakdown({
             target,
             profile,
+            physical,
             collectConfidence,
             graspConfidence,
             pickupSuccessRate,
@@ -144,7 +163,12 @@ export class UtilityEvaluator {
                 score,
                 rawScore,
                 scorePercent: Math.round(score * 100),
+
                 isEnergyViable,
+                isPhysicallyPossible: !physical.hardImpossible,
+                actionability: physical.hardImpossible ? "uncollectable" : "actionable",
+                physical,
+
                 distanceToTarget,
                 distanceTargetToHome,
                 estimatedMissionCost,
@@ -165,22 +189,130 @@ export class UtilityEvaluator {
                     score,
                     isEnergyViable,
                     distanceToTarget,
-                    estimatedMissionCost,
-                    energyMargin,
                     successScore,
                     learningValue,
                     riskPenalty,
                     loadPenalty,
-                    pickupSuccessRate
+                    pickupSuccessRate,
+                    physical
                 }),
                 detailedExplanation: this._makeDetailedExplanation(target, score, breakdown)
             }
         };
     }
 
+    _physicalFeasibility(target, robot, profile) {
+        const entity = target.entity;
+        const props = entity.props || {};
+        const body = robot.body;
+
+        const weightKg = Number(props.weightKg ?? 0.1);
+        const sizeUnits = Number(props.sizeUnits ?? 1);
+        const gripDifficulty = Number(props.gripDifficulty ?? 0.15);
+
+        const maxLiftWeight = body.maxLiftWeight ?? 2.5;
+        const maxGripSize = body.maxGripSize ?? 3.0;
+
+        const tooHeavyByBody = weightKg > maxLiftWeight;
+        const tooLargeByBody = sizeUnits > maxGripSize;
+
+        const learnedTooHeavy = this._affordanceConfidence(target, "too_heavy", 0);
+        const learnedTooLarge = this._affordanceConfidence(target, "too_large", 0);
+        const learnedDifficult = this._affordanceConfidence(target, "difficult_to_grasp", 0);
+
+        const profileTooHeavy = (profile?.tooHeavyFailures ?? 0) > 0;
+        const profileTooLarge = (profile?.tooLargeFailures ?? 0) > 0;
+        const profileGripFailures = (profile?.gripFailures ?? 0) > 0;
+
+        const weightOverflow = tooHeavyByBody
+            ? Math.min(1, (weightKg - maxLiftWeight) / Math.max(1, maxLiftWeight))
+            : 0;
+
+        const sizeOverflow = tooLargeByBody
+            ? Math.min(1, (sizeUnits - maxGripSize) / Math.max(1, maxGripSize))
+            : 0;
+
+        const learnedPenalty =
+            Math.max(0, learnedTooHeavy - 0.35) * 0.55 +
+            Math.max(0, learnedTooLarge - 0.35) * 0.55 +
+            Math.max(0, learnedDifficult - 0.45) * 0.35;
+
+        const experiencePenalty =
+            (profileTooHeavy ? 0.38 : 0) +
+            (profileTooLarge ? 0.38 : 0) +
+            (profileGripFailures ? 0.18 : 0);
+
+        const bodyPenalty =
+            weightOverflow * 0.75 +
+            sizeOverflow * 0.75 +
+            gripDifficulty * 0.25;
+
+        const hardImpossible =
+            tooHeavyByBody ||
+            tooLargeByBody ||
+            learnedTooHeavy >= 0.7 ||
+            learnedTooLarge >= 0.7 ||
+            profileTooHeavy ||
+            profileTooLarge;
+
+        const penalty = this._clamp(bodyPenalty + learnedPenalty + experiencePenalty);
+        const successPenalty = this._clamp(
+            gripDifficulty * 0.25 +
+            learnedDifficult * 0.25 +
+            experiencePenalty * 0.45 +
+            (hardImpossible ? 0.75 : 0)
+        );
+
+        const reasons = [];
+
+        if (tooHeavyByBody) {
+            reasons.push(`zu schwer: ${weightKg}kg > Traglimit ${maxLiftWeight}kg`);
+        }
+
+        if (tooLargeByBody) {
+            reasons.push(`zu groß: Größe ${sizeUnits} > Greiferlimit ${maxGripSize}`);
+        }
+
+        if (learnedTooHeavy >= 0.55) {
+            reasons.push(`gelernt: wahrscheinlich zu schwer (${Math.round(learnedTooHeavy * 100)}%)`);
+        }
+
+        if (learnedTooLarge >= 0.55) {
+            reasons.push(`gelernt: wahrscheinlich zu groß (${Math.round(learnedTooLarge * 100)}%)`);
+        }
+
+        if (learnedDifficult >= 0.55 || profileGripFailures) {
+            reasons.push("schwer greifbar");
+        }
+
+        return {
+            weightKg,
+            sizeUnits,
+            gripDifficulty,
+            maxLiftWeight,
+            maxGripSize,
+
+            tooHeavyByBody,
+            tooLargeByBody,
+            learnedTooHeavy,
+            learnedTooLarge,
+            learnedDifficult,
+
+            profileTooHeavy,
+            profileTooLarge,
+            profileGripFailures,
+
+            hardImpossible,
+            penalty,
+            successPenalty,
+            reasons
+        };
+    }
+
     _makeBreakdown(data) {
         const {
             profile,
+            physical,
             collectConfidence,
             graspConfidence,
             pickupSuccessRate,
@@ -209,7 +341,7 @@ export class UtilityEvaluator {
             contribution: weighted.success,
             text: pickupSuccessRate !== null
                 ? `Erfahrung sagt ${Math.round(pickupSuccessRate * 100)}% Pickup-Erfolg.`
-                : `Noch wenig Erfahrung; Schätzung aus grasp/collect.`
+                : "Schätzung aus grasp/collect und physischer Schwierigkeit."
         });
 
         items.push({
@@ -243,7 +375,7 @@ export class UtilityEvaluator {
             contribution: weighted.learning,
             text: profile
                 ? `Es gibt bereits ${profile.totalEvents} Erfahrung(en) mit diesem Konzept.`
-                : `Neues/kaum bekanntes Konzept: hoher Lernwert.`
+                : "Neues/kaum bekanntes Konzept: hoher Lernwert."
         });
 
         items.push({
@@ -255,6 +387,30 @@ export class UtilityEvaluator {
             contribution: weighted.collect,
             text: `collect: ${Math.round(collectConfidence * 100)}%, grasp: ${Math.round(graspConfidence * 100)}%.`
         });
+
+        if (physical.penalty > 0.05 || physical.hardImpossible) {
+            items.push({
+                id: "physical",
+                label: "Physische Grenze",
+                direction: "minus",
+                rawValue: physical.penalty,
+                weight: 1,
+                contribution: weighted.physical,
+                text: physical.reasons.length > 0
+                    ? physical.reasons.join("; ")
+                    : `Gewicht ${physical.weightKg}kg, Größe ${physical.sizeUnits}, Greifschwierigkeit ${Math.round(physical.gripDifficulty * 100)}%.`
+            });
+        } else {
+            items.push({
+                id: "physical",
+                label: "Physische Grenze",
+                direction: "neutral",
+                rawValue: 0,
+                weight: 1,
+                contribution: 0,
+                text: "Objekt liegt innerhalb der aktuellen Greif- und Traggrenzen."
+            });
+        }
 
         if (riskPenalty > 0) {
             items.push({
@@ -324,6 +480,8 @@ export class UtilityEvaluator {
             scorePercent: target.utility.scorePercent,
             distanceToTarget: target.utility.distanceToTarget,
             isEnergyViable: target.utility.isEnergyViable,
+            isPhysicallyPossible: target.utility.isPhysicallyPossible,
+            actionability: target.utility.actionability,
             explanation: target.utility.explanation,
             strongestPros: this._strongestFactors(target.utility.breakdown, "plus", 2),
             strongestCons: this._strongestFactors(target.utility.breakdown, "minus", 2)
@@ -341,6 +499,7 @@ export class UtilityEvaluator {
                 concept: selected.concept,
                 score: selected.utility.score,
                 scorePercent: selected.utility.scorePercent,
+                actionability: selected.utility.actionability,
                 explanation: selected.utility.explanation,
                 detailedExplanation: selected.utility.detailedExplanation,
                 breakdown: selected.utility.breakdown
@@ -350,6 +509,8 @@ export class UtilityEvaluator {
                 battery: robot.body.battery,
                 trashLoad: robot.body.trashLoad,
                 maxTrashLoad: robot.body.maxTrashLoad,
+                maxLiftWeight: robot.body.maxLiftWeight,
+                maxGripSize: robot.body.maxGripSize,
                 homeKnown: Boolean(worldModel.home)
             }
         };
@@ -383,6 +544,12 @@ export class UtilityEvaluator {
             parts.push("Akku reicht");
         } else {
             parts.push("Akku knapp");
+        }
+
+        if (data.physical?.hardImpossible) {
+            parts.push("nicht sammelbar");
+        } else if ((data.physical?.penalty ?? 0) > 0.2) {
+            parts.push("physisch schwierig");
         }
 
         if (data.riskPenalty > 0) {
@@ -426,17 +593,9 @@ export class UtilityEvaluator {
     }
 
     _learningValue(profile) {
-        if (!profile) {
-            return 0.85;
-        }
-
-        if (profile.totalEvents <= 0) {
-            return 0.85;
-        }
-
-        if (profile.pickupAttempts === 0) {
-            return 0.7;
-        }
+        if (!profile) return 0.85;
+        if (profile.totalEvents <= 0) return 0.85;
+        if (profile.pickupAttempts === 0) return 0.7;
 
         return this._clamp(0.55 / (1 + profile.pickupAttempts * 0.45));
     }

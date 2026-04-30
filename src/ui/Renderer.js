@@ -30,12 +30,12 @@ export class Renderer {
 
     render(world, robot, brain) {
         const brainState = brain.getState();
-        this._drawWorld(world, robot, brain);
+        this._drawWorld(world, robot, brainState, brain);
         this._renderStats(world, robot, brainState);
         this._renderLog(brainState.recentLogLines);
     }
 
-    _drawWorld(world, robot, brain) {
+    _drawWorld(world, robot, brainState, brain) {
         const ctx = this.ctx;
 
         ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
@@ -43,7 +43,7 @@ export class Renderer {
         ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
 
         this._drawKnownOverlay(world, brain);
-        this._drawSpatialMemory(brain);
+        this._drawSpatialMemory(brainState);
         this._drawSensorRange(robot);
         this._drawGrid(world);
 
@@ -67,9 +67,9 @@ export class Renderer {
         }
     }
 
-    _drawSpatialMemory(brain) {
+    _drawSpatialMemory(brainState) {
         const ctx = this.ctx;
-        const spatial = brain.getState().spatial;
+        const spatial = brainState.spatial;
         const regions = spatial?.topRegions || [];
 
         for (const region of regions.slice(0, 6)) {
@@ -95,6 +95,7 @@ export class Renderer {
         }
 
         const best = spatial?.bestPatrolRegion;
+
         if (best?.bounds) {
             const x = best.bounds.minX * this.cellW;
             const y = best.bounds.minY * this.cellH;
@@ -208,22 +209,26 @@ export class Renderer {
         const emotions = state.emotions || {};
         const semantic = state.semantic || {};
 
-        const topSemanticTarget = semantic.collectableTargets?.[0];
+        const topSemanticTarget = semantic.utility?.topActionableTarget || semantic.collectableTargets?.[0];
         const topHazard = semantic.hazards?.[0];
 
         this.statsElement.innerHTML = `
             ${metric("Tick", world.step)}
             ${metric("Akku", `${robot.body.battery.toFixed(1)}% ${bar(robot.body.batteryRatio)}`)}
             ${metric("Müllbehälter", `${robot.body.trashLoad}/${robot.body.maxTrashLoad} ${bar(robot.body.loadRatio)}`)}
+            ${metric("Stabilität", `${Math.round(robot.body.stability)}% ${bar(robot.body.stabilityRatio)}`)}
             ${metric("Gesammelt", robot.body.totalCollected)}
             ${metric("Abgegeben", robot.body.totalEmptied)}
             ${metric("Ziel", `${escapeHtml(goal?.type || "-")}<br><span style="color:#6b7280">${escapeHtml(goal?.reason || "")}</span>`)}
             ${metric("Aktion", `${escapeHtml(action?.type || "-")}<br><span style="color:#6b7280">${escapeHtml(action?.reason || "")}</span>`)}
             ${metric("Aktive Entscheidung", formatActiveDecision(goal?.explanation))}
             ${metric("Ortsgedächtnis", formatSpatialMemory(state.spatial))}
+            ${metric("Nicht sammelbar", formatUncollectableMemory(state.uncollectable))}
             ${metric("Bekannte Welt", `${Math.round((state.knownCellsRatio || 0) * 100)}% ${bar(state.knownCellsRatio || 0)}`)}
             ${metric("Bekannter Müll", state.knownTrashCount)}
             ${metric("Sem. Sammelziele", state.semanticCollectableCount)}
+            ${metric("Machbare Ziele", state.semanticActionableCount ?? 0)}
+            ${metric("Nicht machbar", state.semanticUncollectableCount ?? 0)}
             ${metric("Sem. Risiken", state.semanticHazardCount)}
             ${metric("Relationen", state.relationCount)}
             ${metric("Affordances", state.affordanceCount)}
@@ -273,8 +278,12 @@ function formatSpatialMemory(spatial) {
                 <span style="color:#6b7280">
                     Score ${Math.round((best.finalScore ?? best.score ?? 0) * 100)}%
                     · Risiko ${best.riskPercent}%
-                    · Müll gesehen ${best.trashSeen}
-                    · Risiken gesehen ${best.hazardSeen}
+                </span>
+                <br>
+                <span style="color:#6b7280">
+                    Müll: ${best.uniqueTrashSeen ?? best.trashSeen ?? 0} einzigartig / ${best.trashObservations ?? 0} Beobachtungen
+                    <br>
+                    Risiken: ${best.uniqueHazardSeen ?? best.hazardSeen ?? 0} einzigartig / ${best.hazardObservations ?? 0} Beobachtungen
                 </span>
                 <br>
                 <span style="color:#6b7280">${escapeHtml(best.summary || "")}</span>
@@ -289,13 +298,48 @@ function formatSpatialMemory(spatial) {
             <span style="color:#6b7280">
                 Score ${region.scorePercent}%
                 · Risiko ${region.riskPercent}%
-                · Müll ${region.trashSeen}/${region.trashCollected}
-                · Tiere/Menschen ${region.hazardSeen}
+                <br>
+                Müll: ${region.uniqueTrashSeen ?? region.trashSeen ?? 0} einzigartig / ${region.trashObservations ?? 0} Beobachtungen
+                <br>
+                Risiken: ${region.uniqueHazardSeen ?? region.hazardSeen ?? 0} einzigartig / ${region.hazardObservations ?? 0} Beobachtungen
             </span>
         </div>
     `).join("") || "";
 
     return bestText + regions;
+}
+
+function formatUncollectableMemory(uncollectable) {
+    if (!uncollectable || uncollectable.count === 0) {
+        return "-";
+    }
+
+    const items = (uncollectable.items || []).slice(0, 5).map(item => `
+        <div style="margin-bottom:8px">
+            <strong>${escapeHtml(item.label)}</strong>
+            <br>
+            <span style="color:#6b7280">
+                ${escapeHtml(item.concept)}
+                · ${item.status === "uncollectable" ? "nicht sammelbar" : "schwierig"}
+                · Schwere ${item.severityPercent}%
+            </span>
+            <br>
+            <span style="color:#6b7280">${escapeHtml(item.summary || "")}</span>
+        </div>
+    `).join("");
+
+    const concepts = (uncollectable.conceptProfiles || []).slice(0, 3).map(profile => `
+        <div style="margin-bottom:4px">
+            <span style="color:#6b7280">
+                ${escapeHtml(profile.summary)}
+            </span>
+        </div>
+    `).join("");
+
+    return `
+        ${items}
+        ${concepts ? `<div><strong>Konzepte</strong>${concepts}</div>` : ""}
+    `;
 }
 
 function formatActiveDecision(explanation) {
@@ -336,12 +380,17 @@ function formatActiveDecision(explanation) {
 function formatTopUtilityTarget(target) {
     if (!target) return "-";
 
+    const physicalText = target.utility?.isPhysicallyPossible === false
+        ? "<br><span style=\"color:#b45309\">physisch nicht machbar</span>"
+        : "";
+
     return `
         ${escapeHtml(target.label)}
         <br>
         <span style="color:#6b7280">
             ${escapeHtml(target.concept)} · Utility ${target.utility?.scorePercent ?? "?"}%
         </span>
+        ${physicalText}
         <br>
         <span style="color:#6b7280">
             ${escapeHtml(target.utility?.explanation || "")}
@@ -415,8 +464,9 @@ function formatUtilityRanking(targets) {
         return "-";
     }
 
-    return targets.slice(0, 4).map((target, index) => {
+    return targets.slice(0, 6).map((target, index) => {
         const utility = target.utility;
+
         const strongestMinus = utility?.breakdown
             ?.filter(item => item.direction === "minus")
             ?.sort((a, b) => Math.abs(b.contribution) - Math.abs(a.contribution))
@@ -425,6 +475,10 @@ function formatUtilityRanking(targets) {
         const minusText = strongestMinus
             ? `<br><span style="color:#b45309">Minus: ${escapeHtml(strongestMinus.label)} - ${escapeHtml(strongestMinus.text)}</span>`
             : "";
+
+        const actionability = utility?.isPhysicallyPossible === false
+            ? `<br><span style="color:#b45309">Status: bekannt, aber nicht sammelbar</span>`
+            : `<br><span style="color:#6b7280">Status: machbar</span>`;
 
         return `
             <div style="margin-bottom:8px">
@@ -436,6 +490,7 @@ function formatUtilityRanking(targets) {
                     · Distanz ${utility?.distanceToTarget ?? "?"}
                     · ${utility?.isEnergyViable ? "Akku ok" : "Akku knapp"}
                 </span>
+                ${actionability}
                 ${minusText}
             </div>
         `;
@@ -453,23 +508,66 @@ function formatExperienceProfiles(profiles) {
         return "-";
     }
 
-    return profiles.slice(0, 5).map(profile => {
-        const rate = profile.pickupAttempts > 0
-            ? `${Math.round((profile.pickupSuccessRate || 0) * 100)}%`
-            : "-";
-
+    return profiles.slice(0, 6).map(profile => {
         const reliability = Math.round((profile.reliability || 0) * 100);
 
         const tags = profile.tags?.length
-            ? `<br><span style="color:#6b7280">${profile.tags.slice(0, 4).map(escapeHtml).join(", ")}</span>`
+            ? `<br><span style="color:#6b7280">${profile.tags.slice(0, 5).map(escapeHtml).join(", ")}</span>`
             : "";
+
+        if (profile.profileType === "utility") {
+            return `
+                <div style="margin-bottom:8px">
+                    <strong>${escapeHtml(profile.concept)}</strong>
+                    <br>
+                    Nutzung:
+                    ${profile.chargeSuccess > 0 ? `${profile.chargeSuccess}x geladen` : ""}
+                    ${profile.emptySuccess > 0 ? `${profile.emptySuccess}x entladen` : ""}
+                    · Vertrauen: ${reliability}%
+                    ${tags}
+                </div>
+            `;
+        }
+
+        if (profile.profileType === "physical_limit") {
+            const rate = profile.pickupAttempts > 0
+                ? `${Math.round((profile.pickupSuccessRate || 0) * 100)}%`
+                : "-";
+
+            return `
+                <div style="margin-bottom:8px">
+                    <strong>${escapeHtml(profile.concept)}</strong>
+                    <br>
+                    Physische Grenze:
+                    Pickups ${profile.pickupSuccess}/${profile.pickupAttempts}
+                    · Erfolg ${rate}
+                    · zu schwer ${profile.tooHeavyFailures}
+                    · zu groß ${profile.tooLargeFailures}
+                    ${tags}
+                </div>
+            `;
+        }
+
+        if (profile.pickupAttempts > 0) {
+            const rate = `${Math.round((profile.pickupSuccessRate || 0) * 100)}%`;
+
+            return `
+                <div style="margin-bottom:8px">
+                    <strong>${escapeHtml(profile.concept)}</strong>
+                    <br>
+                    Pickups: ${profile.pickupSuccess}/${profile.pickupAttempts}
+                    · Erfolg: ${rate}
+                    · Vertrauen: ${reliability}%
+                    ${tags}
+                </div>
+            `;
+        }
 
         return `
             <div style="margin-bottom:8px">
                 <strong>${escapeHtml(profile.concept)}</strong>
                 <br>
-                Pickups: ${profile.pickupSuccess}/${profile.pickupAttempts}
-                · Erfolg: ${rate}
+                Ereignisse: ${profile.totalEvents}
                 · Vertrauen: ${reliability}%
                 ${tags}
             </div>
