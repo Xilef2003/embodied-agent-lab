@@ -8,6 +8,7 @@ import { SemanticMemory } from "./SemanticMemory.js";
 import { ExperienceLearner } from "./ExperienceLearner.js";
 import { ExperienceSummary } from "./ExperienceSummary.js";
 import { UtilityEvaluator } from "./UtilityEvaluator.js";
+import { SpatialMemory } from "./SpatialMemory.js";
 
 export class Brain {
     constructor(worldWidth, worldHeight) {
@@ -16,6 +17,7 @@ export class Brain {
         this.experienceLearner = new ExperienceLearner();
         this.experienceSummary = new ExperienceSummary();
         this.utilityEvaluator = new UtilityEvaluator();
+        this.spatialMemory = new SpatialMemory(worldWidth, worldHeight);
 
         this.needSystem = new NeedSystem();
         this.emotionSystem = new EmotionSystem();
@@ -30,7 +32,8 @@ export class Brain {
             action: null,
             semantic: null,
             experience: null,
-            experienceSummary: null
+            experienceSummary: null,
+            spatial: null
         };
     }
 
@@ -50,6 +53,13 @@ export class Brain {
             this.experienceSummary
         );
 
+        this.spatialMemory.update(observation, semantic, robot);
+
+        const spatial = this.spatialMemory.getState(
+            robot.position,
+            observation.step
+        );
+
         const learningState = this.learningSystem.getState();
         const needs = this.needSystem.evaluate(robot, observation, this.worldModel);
         const emotions = this.emotionSystem.evaluate(needs, learningState, robot);
@@ -59,7 +69,8 @@ export class Brain {
             emotions,
             robot,
             this.worldModel,
-            semantic
+            semantic,
+            spatial
         );
 
         const action = this.planner.plan(
@@ -68,7 +79,8 @@ export class Brain {
             robot,
             observation,
             emotions,
-            semantic
+            semantic,
+            spatial
         );
 
         this.current = {
@@ -77,7 +89,8 @@ export class Brain {
             emotions,
             goal,
             action,
-            semantic
+            semantic,
+            spatial
         };
 
         return action;
@@ -98,6 +111,18 @@ export class Brain {
             this.semanticMemory
         );
 
+        if (result?.ok && result.type === "pickup" && result.target) {
+            this.spatialMemory.registerPickup(result.target, observation.step);
+        }
+
+        if (!result?.ok && result?.blockedCell) {
+            this.spatialMemory.registerBlockedCell(
+                result.blockedCell.x,
+                result.blockedCell.y,
+                observation.step
+            );
+        }
+
         this.worldModel.integrateActionResult(action, result);
 
         const episode = this.learningSystem.learn(
@@ -110,7 +135,8 @@ export class Brain {
         this.current = {
             ...this.current,
             experience: this.experienceLearner.getState(),
-            experienceSummary: this.experienceSummary.getState(this.semanticMemory)
+            experienceSummary: this.experienceSummary.getState(this.semanticMemory),
+            spatial: this.spatialMemory.getState(robot.position, observation.step)
         };
 
         return {
@@ -130,10 +156,18 @@ export class Brain {
     getState() {
         const experienceState = this.experienceLearner.getState();
         const summaryState = this.experienceSummary.getState(this.semanticMemory);
+        const spatialState = this.spatialMemory.getState(
+            this.current.action?.position || null,
+            this.worldModel.step ?? 0
+        );
 
         const summaryLines = summaryState.recentEvents
             .slice(-4)
             .map(event => `[summary] ${event.message}`);
+
+        const spatialLines = (this.current.spatial?.recentEvents || [])
+            .slice(-2)
+            .map(event => `[place] ${event.message}`);
 
         return {
             ...this.current,
@@ -141,6 +175,7 @@ export class Brain {
             learning: this.learningSystem.getState(),
             experience: experienceState,
             experienceSummary: summaryState,
+            spatial: this.current.spatial || spatialState,
 
             knownCellsRatio: this.worldModel.getKnownCellRatio(),
             knownTrashCount: this.worldModel.getKnownTrash().length,
@@ -154,6 +189,10 @@ export class Brain {
             utilityRankedTargets: this.current.semantic?.utility?.rankedCollectableTargets ?? [],
             decisionExplanation: this.current.semantic?.utility?.decisionExplanation ?? null,
 
+            spatialBestPatrolRegion: this.current.spatial?.bestPatrolRegion ?? null,
+            spatialTopRegions: this.current.spatial?.topRegions ?? [],
+            spatialRegionCount: this.current.spatial?.regionCount ?? 0,
+
             semanticEvents: this.current.semantic?.recentSemanticEvents ?? [],
             experienceEventCount: experienceState.eventCount,
             experienceConceptCount: summaryState.conceptCount,
@@ -165,7 +204,8 @@ export class Brain {
 
             recentLogLines: [
                 ...this.learningSystem.getRecentLogLines(8),
-                ...summaryLines
+                ...summaryLines,
+                ...spatialLines
             ]
         };
     }

@@ -43,6 +43,7 @@ export class Renderer {
         ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
 
         this._drawKnownOverlay(world, brain);
+        this._drawSpatialMemory(brain);
         this._drawSensorRange(robot);
         this._drawGrid(world);
 
@@ -63,6 +64,48 @@ export class Renderer {
                 ctx.fillStyle = knownCells.has(key) ? COLORS.known : COLORS.unknown;
                 ctx.fillRect(x * this.cellW, y * this.cellH, this.cellW, this.cellH);
             }
+        }
+    }
+
+    _drawSpatialMemory(brain) {
+        const ctx = this.ctx;
+        const spatial = brain.getState().spatial;
+        const regions = spatial?.topRegions || [];
+
+        for (const region of regions.slice(0, 6)) {
+            if (!region.bounds || region.score <= 0.1) continue;
+
+            const x = region.bounds.minX * this.cellW;
+            const y = region.bounds.minY * this.cellH;
+            const w = (region.bounds.maxX - region.bounds.minX + 1) * this.cellW;
+            const h = (region.bounds.maxY - region.bounds.minY + 1) * this.cellH;
+
+            ctx.save();
+            ctx.globalAlpha = Math.min(0.22, 0.06 + region.score * 0.18);
+            ctx.fillStyle = "#f59e0b";
+            ctx.fillRect(x, y, w, h);
+            ctx.restore();
+
+            ctx.save();
+            ctx.strokeStyle = "#f59e0b";
+            ctx.globalAlpha = 0.5;
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x + 2, y + 2, w - 4, h - 4);
+            ctx.restore();
+        }
+
+        const best = spatial?.bestPatrolRegion;
+        if (best?.bounds) {
+            const x = best.bounds.minX * this.cellW;
+            const y = best.bounds.minY * this.cellH;
+            const w = (best.bounds.maxX - best.bounds.minX + 1) * this.cellW;
+            const h = (best.bounds.maxY - best.bounds.minY + 1) * this.cellH;
+
+            ctx.save();
+            ctx.strokeStyle = "#dc2626";
+            ctx.lineWidth = 3;
+            ctx.strokeRect(x + 4, y + 4, w - 8, h - 8);
+            ctx.restore();
         }
     }
 
@@ -177,6 +220,7 @@ export class Renderer {
             ${metric("Ziel", `${escapeHtml(goal?.type || "-")}<br><span style="color:#6b7280">${escapeHtml(goal?.reason || "")}</span>`)}
             ${metric("Aktion", `${escapeHtml(action?.type || "-")}<br><span style="color:#6b7280">${escapeHtml(action?.reason || "")}</span>`)}
             ${metric("Aktive Entscheidung", formatActiveDecision(goal?.explanation))}
+            ${metric("Ortsgedächtnis", formatSpatialMemory(state.spatial))}
             ${metric("Bekannte Welt", `${Math.round((state.knownCellsRatio || 0) * 100)}% ${bar(state.knownCellsRatio || 0)}`)}
             ${metric("Bekannter Müll", state.knownTrashCount)}
             ${metric("Sem. Sammelziele", state.semanticCollectableCount)}
@@ -214,6 +258,44 @@ function metric(label, value) {
 function bar(value) {
     const pct = Math.max(0, Math.min(100, Math.round(value * 100)));
     return `<div class="bar"><span style="width:${pct}%"></span></div>`;
+}
+
+function formatSpatialMemory(spatial) {
+    if (!spatial) return "-";
+
+    const best = spatial.bestPatrolRegion;
+
+    const bestText = best
+        ? `
+            <div style="margin-bottom:8px">
+                <strong>Beste Prüfregion: ${escapeHtml(best.id)}</strong>
+                <br>
+                <span style="color:#6b7280">
+                    Score ${Math.round((best.finalScore ?? best.score ?? 0) * 100)}%
+                    · Risiko ${best.riskPercent}%
+                    · Müll gesehen ${best.trashSeen}
+                    · Risiken gesehen ${best.hazardSeen}
+                </span>
+                <br>
+                <span style="color:#6b7280">${escapeHtml(best.summary || "")}</span>
+            </div>
+        `
+        : `<div style="margin-bottom:8px">Keine starke Prüfregion.</div>`;
+
+    const regions = spatial.topRegions?.slice(0, 4).map(region => `
+        <div style="margin-bottom:6px">
+            <strong>Region ${escapeHtml(region.id)}</strong>
+            <br>
+            <span style="color:#6b7280">
+                Score ${region.scorePercent}%
+                · Risiko ${region.riskPercent}%
+                · Müll ${region.trashSeen}/${region.trashCollected}
+                · Tiere/Menschen ${region.hazardSeen}
+            </span>
+        </div>
+    `).join("") || "";
+
+    return bestText + regions;
 }
 
 function formatActiveDecision(explanation) {

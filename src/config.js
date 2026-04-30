@@ -39,5 +39,10 @@ export const GOAL = Object.freeze({
     EXPLORE: "explore",
     AVOID: "avoid",
     RETURN_HOME: "return_home",
-    STANDBY: "standby"
+    STANDBY: "standby",
+
+    // v1.1:
+    // Der Agent kehrt bewusst in eine interessante Region zurück,
+    // weil dort historisch Müll/Risiken/Unsicherheit beobachtet wurden.
+    PATROL_AREA: "patrol_area"
 });

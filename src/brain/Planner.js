@@ -1,417 +1,615 @@
-import { ACTION, GOAL } from "../config.js";
-import { keyOf, manhattan, neighbors4 } from "../utils/Grid.js";
+import { GOAL } from "../config.js";
+import { manhattan } from "../utils/Grid.js";
 
 /**
- * Planner v1.0
+ * GoalSystem v1.1
  *
  * Neu:
- * - Safety-Planning berücksichtigt Goal-Commitment.
- * - AVOID maximiert Abstand zu allen nahen Risiken.
- * - COLLECT_TRASH nutzt weiterhin Utility-Ziel aus GoalSystem.
+ * - SpatialMemory:
+ *   Wenn kein direktes Sammelziel aktiv ist, kann der Agent gezielt
+ *   interessante Regionen erneut prüfen.
+ *
+ * - Patrol Area:
+ *   "Dort habe ich früher Müll/Tiere/Ungewissheit gesehen,
+ *    also schaue ich dort wieder nach."
  */
-export class Planner {
-    constructor() {
-        this.lastAction = null;
-        this.lastGoal = null;
-        this.recentPositions = [];
-    }
+export class GoalSystem {
+    constructor(options = {}) {
+        this.config = {
+            chargeUntilRatio: 0.82,
+            leaveBaseMinBatteryRatio: 0.55,
+            reserveBattery: 14,
+            moveCostEstimate: 0.7,
+            missionCoverageThreshold: 0.88,
+            maxTicksWithoutKnownTrash: 180,
+            minUtilityToStartMission: 0.18,
 
-    plan(goal, worldModel, robot, observation, emotions, semantic = null) {
-        this._rememberPosition(robot);
-        this.lastGoal = goal;
+            safetyTriggerDistance: 1,
+            safetyReleaseDistance: 3,
 
-        let action;
+            minPatrolScore: 0.28,
 
-        switch (goal.type) {
-            case GOAL.CHARGE:
-                action = this._planCharge(worldModel, robot);
-                break;
-
-            case GOAL.EMPTY_LOAD:
-                action = this._planEmptyLoad(worldModel, robot);
-                break;
-
-            case GOAL.COLLECT_TRASH:
-                action = this._planCollectTrash(goal, worldModel, robot, semantic);
-                break;
-
-            case GOAL.AVOID:
-                action = this._planAvoid(goal, worldModel, robot, semantic);
-                break;
-
-            case GOAL.RETURN_HOME:
-                action = this._planReturnHome(worldModel, robot);
-                break;
-
-            case GOAL.STANDBY:
-                action = this._planStandby();
-                break;
-
-            case GOAL.EXPLORE:
-            default:
-                action = this._planExplore(worldModel, robot, emotions);
-                break;
-        }
-
-        this.lastAction = action;
-        return action;
-    }
-
-    _planCharge(worldModel, robot) {
-        if (!worldModel.home) {
-            return {
-                type: ACTION.SCAN,
-                reason: "Ladestation unbekannt, scanne Umgebung."
-            };
-        }
-
-        if (manhattan(robot, worldModel.home) === 0) {
-            return {
-                type: ACTION.CHARGE,
-                reason: "An Ladestation angekommen."
-            };
-        }
-
-        return this._moveToward(robot, worldModel.home, worldModel, "Zur Ladestation bewegen.");
-    }
-
-    _planEmptyLoad(worldModel, robot) {
-        if (!worldModel.home) {
-            return {
-                type: ACTION.SCAN,
-                reason: "Basis unbekannt, scanne Umgebung."
-            };
-        }
-
-        if (manhattan(robot, worldModel.home) === 0) {
-            return {
-                type: ACTION.EMPTY,
-                reason: "Müllbehälter an Basis leeren."
-            };
-        }
-
-        return this._moveToward(robot, worldModel.home, worldModel, "Zur Basis zurückkehren.");
-    }
-
-    _planReturnHome(worldModel, robot) {
-        if (!worldModel.home) {
-            return {
-                type: ACTION.SCAN,
-                reason: "Basis unbekannt, scanne Umgebung."
-            };
-        }
-
-        if (manhattan(robot, worldModel.home) === 0) {
-            return {
-                type: ACTION.IDLE,
-                reason: "Basis erreicht. Warte auf neues Ziel."
-            };
-        }
-
-        return this._moveToward(robot, worldModel.home, worldModel, "Mission abgeschlossen, Rückkehr zur Basis.");
-    }
-
-    _planStandby() {
-        return {
-            type: ACTION.IDLE,
-            reason: "Standby: Mission abgeschlossen, keine semantisch sammelbaren Ziele."
+            ...options
         };
+
+        this.committedGoal = null;
+        this.committedSafetyTargetId = null;
+        this.ticksWithoutKnownTrash = 0;
     }
 
-    _planCollectTrash(goal, worldModel, robot, semantic = null) {
-        const semanticTarget =
-            semantic?.collectableTargets?.find(item => item.entity.id === goal.targetId) ||
-            semantic?.collectableTargets?.[0] ||
-            null;
-
-        const target =
-            semanticTarget?.entity ||
-            (goal.targetId ? worldModel.knownEntities.get(goal.targetId) : null) ||
-            worldModel.getNearestKnownTrash(robot.position);
-
-        if (!target) {
-            return {
-                type: ACTION.SCAN,
-                reason: "Kein konkretes sammelbares Ziel bekannt."
-            };
-        }
-
-        if (manhattan(robot, target) <= 1) {
-            const semanticReason = semanticTarget
-                ? `${semanticTarget.label} ist '${semanticTarget.concept}' mit Utility ${semanticTarget.utility?.scorePercent ?? "?"}%.`
-                : `${target.label} ist als Müll markiert.`;
-
-            return {
-                type: ACTION.PICKUP,
-                targetId: target.id,
-                reason: `${target.label} greifen. ${semanticReason}`
-            };
-        }
-
-        const reason = semanticTarget
-            ? `${target.label} ansteuern. Utility: ${semanticTarget.utility?.explanation || "unbekannt"}.`
-            : `${target.label} ansteuern.`;
-
-        return this._moveToward(robot, target, worldModel, reason);
-    }
-
-    _planAvoid(goal, worldModel, robot, semantic = null) {
-        const safeDistance = goal.safeDistance ?? 3;
+    choose(needs, emotions, robot, worldModel, semantic = null, spatial = null) {
+        const body = robot.body;
+        const position = robot.position;
+        const home = worldModel.home;
+        const atHome = Boolean(home && manhattan(position, home) === 0);
 
         const semanticHazards = semantic?.hazards || [];
-        const relevantSemanticHazards = semanticHazards
-            .filter(item => item.distance < safeDistance + 1);
+        const nearestHazard = semanticHazards[0] || null;
 
-        const fallbackHazards = worldModel.getKnownHazards(robot.position, safeDistance + 1)
-            .map(entity => ({
-                id: entity.id,
-                label: entity.label,
-                entity,
-                distance: manhattan(robot.position, entity),
-                concept: entity.type
-            }));
+        const immediateHazard = semanticHazards.find(
+            hazard => hazard.distance <= this.config.safetyTriggerDistance
+        );
 
-        const hazards = relevantSemanticHazards.length > 0
-            ? relevantSemanticHazards
-            : fallbackHazards;
+        const committedHazard = this.committedSafetyTargetId
+            ? semanticHazards.find(hazard => hazard.id === this.committedSafetyTargetId)
+            : null;
 
-        if (hazards.length === 0) {
-            return {
-                type: ACTION.SCAN,
-                reason: "Risiko nicht mehr sichtbar, scanne neu."
-            };
-        }
+        const collectableTargets = semantic?.collectableTargets || [];
+        const viableTargets = collectableTargets.filter(item =>
+            item.utility?.isEnergyViable !== false &&
+            (item.utility?.score ?? 0) >= this.config.minUtilityToStartMission
+        );
 
-        const primaryHazard =
-            hazards.find(item => item.id === goal.hazardId) ||
-            hazards[0];
+        const bestUtilityTarget = viableTargets[0] || collectableTargets[0] || null;
+        const nearestTarget = bestUtilityTarget?.entity || null;
 
-        const currentMinDistance = this._minDistanceToHazards(robot.position, hazards);
+        const fallbackKnownTrash = worldModel.getKnownTrash();
+        const fallbackNearestTrash = worldModel.getNearestKnownTrash(position);
 
-        const candidates = neighbors4(robot.x, robot.y)
-            .filter(cell => this._isUsableCell(cell, worldModel))
-            .map(cell => {
-                const minDistanceToHazards = this._minDistanceToHazards(cell, hazards);
-                const distanceToPrimary = manhattan(cell, primaryHazard.entity || primaryHazard);
-                const revisitPenalty = this._recentVisitPenalty(cell);
-                const improvement = minDistanceToHazards - currentMinDistance;
+        const knownTargetCount = collectableTargets.length || fallbackKnownTrash.length;
+        const targetForMission = nearestTarget || fallbackNearestTrash;
 
+        const bestPatrolRegion = spatial?.bestPatrolRegion || null;
+
+        const knownCoverage = worldModel.getKnownCellRatio();
+
+        this._updateMissionMemory(knownTargetCount);
+
+        const suppressedBase = this._makeSuppressedOptions({
+            body,
+            atHome,
+            nearestTarget: bestUtilityTarget,
+            home,
+            knownTargetCount,
+            knownCoverage,
+            needs,
+            bestPatrolRegion
+        });
+
+        // 1. Safety Commitment bleibt aktiv, bis Abstand wirklich wiederhergestellt ist.
+        if (this.committedGoal === GOAL.AVOID) {
+            const hazard = committedHazard || nearestHazard;
+
+            if (hazard && hazard.distance < this.config.safetyReleaseDistance) {
                 return {
-                    ...cell,
-                    minDistanceToHazards,
-                    distanceToPrimary,
-                    revisitPenalty,
-                    improvement,
-                    score:
-                        minDistanceToHazards * 3 +
-                        distanceToPrimary * 1.2 +
-                        improvement * 2 -
-                        revisitPenalty
+                    type: GOAL.AVOID,
+                    priority: 1,
+                    hazardId: hazard.id,
+                    hazardLabel: hazard.label,
+                    safeDistance: this.config.safetyReleaseDistance,
+                    reason:
+                        `Sicherheitsmodus bleibt aktiv: ${hazard.label} ist noch ` +
+                        `${hazard.distance} Feld(er) entfernt.`,
+                    explanation: this._explainActiveDecision({
+                        activeGoal: GOAL.AVOID,
+                        title: "Aktive Entscheidung: Sicherheit",
+                        summary:
+                            `Der Agent hält weiter Abstand zu ${hazard.label}. ` +
+                            `Er wechselt erst zurück, wenn mindestens ` +
+                            `${this.config.safetyReleaseDistance} Felder Abstand erreicht sind.`,
+                        priority: "safety",
+                        evidence: [
+                            `${hazard.label} Distanz: ${hazard.distance}`,
+                            `Caution: ${emotions.caution.toFixed(2)}`,
+                            `Safety-Release-Distanz: ${this.config.safetyReleaseDistance}`
+                        ],
+                        suppressedGoals: suppressedBase
+                    })
                 };
-            })
-            .sort((a, b) => b.score - a.score);
+            }
 
-        const best = candidates[0];
+            this.committedGoal = null;
+            this.committedSafetyTargetId = null;
+        }
 
-        if (!best) {
+        // 2. Sicherheit überschreibt alles.
+        if (immediateHazard && emotions.caution > 0.35) {
+            this.committedGoal = GOAL.AVOID;
+            this.committedSafetyTargetId = immediateHazard.id;
+
             return {
-                type: ACTION.IDLE,
-                reason: "Kein sicherer Ausweichschritt bekannt."
+                type: GOAL.AVOID,
+                priority: 1,
+                hazardId: immediateHazard.id,
+                hazardLabel: immediateHazard.label,
+                safeDistance: this.config.safetyReleaseDistance,
+                reason: `Direktes Risiko in der Nähe: ${immediateHazard.label}.`,
+                explanation: this._explainActiveDecision({
+                    activeGoal: GOAL.AVOID,
+                    title: "Aktive Entscheidung: Sicherheits-Override",
+                    summary:
+                        `${immediateHazard.label} ist zu nah. Sicherheit überschreibt ` +
+                        `Entladen, Sammeln, Erkunden, Patrouille und Laden.`,
+                    priority: "safety",
+                    evidence: [
+                        `${immediateHazard.label} Distanz: ${immediateHazard.distance}`,
+                        `Caution: ${emotions.caution.toFixed(2)}`,
+                        `Safety-Trigger-Distanz: ${this.config.safetyTriggerDistance}`
+                    ],
+                    suppressedGoals: suppressedBase
+                })
             };
         }
 
-        const hazardNames = hazards
-            .slice(0, 3)
-            .map(item => item.label || item.concept || "Risiko")
-            .join(", ");
+        // 3. Entladen bleibt aktiv, bis der Behälter leer ist.
+        if (this.committedGoal === GOAL.EMPTY_LOAD) {
+            if (body.trashLoad > 0) {
+                return {
+                    type: GOAL.EMPTY_LOAD,
+                    priority: 0.96,
+                    reason: "Entlade-Ziel wird beibehalten, bis der Behälter leer ist.",
+                    explanation: this._explainActiveDecision({
+                        activeGoal: GOAL.EMPTY_LOAD,
+                        title: "Aktive Entscheidung: Entladen fortsetzen",
+                        summary:
+                            "Der Behälter enthält noch Müll. Der Agent bleibt beim Ziel, " +
+                            "zur Basis zu fahren und zu entladen.",
+                        priority: "body_state",
+                        evidence: [
+                            `Müllbehälter: ${body.trashLoad}/${body.maxTrashLoad}`,
+                            `Home bekannt: ${home ? "ja" : "nein"}`
+                        ],
+                        suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.EMPTY_LOAD)
+                    })
+                };
+            }
 
-        return {
-            type: ACTION.MOVE,
-            dx: best.x - robot.x,
-            dy: best.y - robot.y,
-            reason:
-                `Sicherheitsabstand erhöhen. Risiken: ${hazardNames}. ` +
-                `Abstand ${currentMinDistance} -> ${best.minDistanceToHazards}.`
-        };
-    }
+            this.committedGoal = null;
+        }
 
-    _planExplore(worldModel, robot, emotions) {
-        if (emotions?.frustration > 0.75) {
+        if (body.isLoadFull) {
+            this.committedGoal = GOAL.EMPTY_LOAD;
+
             return {
-                type: ACTION.SCAN,
-                reason: "Frustration hoch, erst neu orientieren."
+                type: GOAL.EMPTY_LOAD,
+                priority: 0.96,
+                reason: "Müllbehälter ist voll.",
+                explanation: this._explainActiveDecision({
+                    activeGoal: GOAL.EMPTY_LOAD,
+                    title: "Aktive Entscheidung: Behälter voll",
+                    summary:
+                        "Der Agent kann keine weiteren Objekte aufnehmen. " +
+                        "Entladen hat Vorrang vor Sammeln und Patrouille.",
+                    priority: "body_state",
+                    evidence: [
+                        `Müllbehälter: ${body.trashLoad}/${body.maxTrashLoad}`,
+                        `Bestes Sammelziel wäre: ${bestUtilityTarget?.label || "-"}`
+                    ],
+                    suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.EMPTY_LOAD)
+                })
             };
         }
 
-        const target = worldModel.getExplorationTarget(robot.position);
+        if (atHome && body.trashLoad > 0) {
+            this.committedGoal = GOAL.EMPTY_LOAD;
 
-        if (!target) {
             return {
-                type: ACTION.SCAN,
-                reason: "Keine unbekannten Ziele gefunden."
+                type: GOAL.EMPTY_LOAD,
+                priority: 0.88,
+                reason: "An der Basis: gesammelten Müll abgeben.",
+                explanation: this._explainActiveDecision({
+                    activeGoal: GOAL.EMPTY_LOAD,
+                    title: "Aktive Entscheidung: Müll an Basis abgeben",
+                    summary:
+                        "Der Agent ist an der Basis und trägt Müll. " +
+                        "Er entlädt, bevor er neue Ziele verfolgt.",
+                    priority: "body_state",
+                    evidence: [
+                        "Position: Basis",
+                        `Müllbehälter: ${body.trashLoad}/${body.maxTrashLoad}`
+                    ],
+                    suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.EMPTY_LOAD)
+                })
             };
         }
 
-        return this._moveToward(robot, target, worldModel, "Unbekannten Bereich erkunden.");
-    }
+        // 4. Laden bleibt aktiv, bis genug Akku da ist.
+        if (this.committedGoal === GOAL.CHARGE) {
+            if (!atHome || body.batteryRatio < this.config.chargeUntilRatio) {
+                return {
+                    type: GOAL.CHARGE,
+                    priority: 1,
+                    reason:
+                        `Lade-Ziel wird beibehalten bis ` +
+                        `${Math.round(this.config.chargeUntilRatio * 100)}% Akku.`,
+                    explanation: this._explainActiveDecision({
+                        activeGoal: GOAL.CHARGE,
+                        title: "Aktive Entscheidung: Laden fortsetzen",
+                        summary:
+                            "Der Agent hat sich zum Laden verpflichtet und verlässt die Basis " +
+                            "erst wieder, wenn genug Energie vorhanden ist.",
+                        priority: "energy",
+                        evidence: [
+                            `Akku: ${Math.round(body.batteryRatio * 100)}%`,
+                            `Ladeziel: ${Math.round(this.config.chargeUntilRatio * 100)}%`
+                        ],
+                        suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.CHARGE)
+                    })
+                };
+            }
 
-    _moveToward(robot, target, worldModel, reason) {
-        const path = this._findPathBFS(robot.position, target, worldModel);
+            this.committedGoal = null;
+        }
 
-        if (path.length >= 2) {
-            const next = path[1];
+        if (body.isBatteryCritical || needs.returnRisk > 0.35) {
+            this.committedGoal = GOAL.CHARGE;
 
             return {
-                type: ACTION.MOVE,
-                dx: next.x - robot.x,
-                dy: next.y - robot.y,
-                reason: `${reason} Pfadlänge: ${path.length - 1}.`
+                type: GOAL.CHARGE,
+                priority: 1,
+                reason: "Akku kritisch oder Rückweg gefährdet.",
+                explanation: this._explainActiveDecision({
+                    activeGoal: GOAL.CHARGE,
+                    title: "Aktive Entscheidung: Energie sichern",
+                    summary:
+                        "Der Agent priorisiert Selbsterhaltung. Akku oder Rückwegrisiko " +
+                        "ist zu kritisch für weitere Missionen.",
+                    priority: "energy",
+                    evidence: [
+                        `Akku: ${Math.round(body.batteryRatio * 100)}%`,
+                        `Return Risk: ${needs.returnRisk.toFixed(2)}`
+                    ],
+                    suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.CHARGE)
+                })
             };
         }
 
-        const local = this._bestLocalStep(robot, target, worldModel);
+        if (atHome && body.batteryRatio < this.config.leaveBaseMinBatteryRatio) {
+            this.committedGoal = GOAL.CHARGE;
 
-        if (local) {
             return {
-                type: ACTION.MOVE,
-                dx: local.x - robot.x,
-                dy: local.y - robot.y,
-                reason: `${reason} Kein sicherer Gesamtpfad, lokaler Suchschritt.`
+                type: GOAL.CHARGE,
+                priority: 0.92,
+                reason:
+                    `An Basis: vor neuer Mission mindestens ` +
+                    `${Math.round(this.config.leaveBaseMinBatteryRatio * 100)}% Akku laden.`,
+                explanation: this._explainActiveDecision({
+                    activeGoal: GOAL.CHARGE,
+                    title: "Aktive Entscheidung: Vor Mission aufladen",
+                    summary:
+                        "Der Agent ist an der Basis, aber die Energie reicht noch nicht " +
+                        "für eine robuste neue Mission.",
+                    priority: "energy",
+                    evidence: [
+                        `Akku: ${Math.round(body.batteryRatio * 100)}%`,
+                        `Minimum zum Losfahren: ${Math.round(this.config.leaveBaseMinBatteryRatio * 100)}%`
+                    ],
+                    suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.CHARGE)
+                })
             };
         }
 
-        return {
-            type: ACTION.SCAN,
-            reason: "Kein Pfad bekannt, scanne zur Neuorientierung."
-        };
-    }
+        if (body.isBatteryLow && home) {
+            this.committedGoal = GOAL.CHARGE;
 
-    _findPathBFS(start, goal, worldModel) {
-        const startKey = keyOf(start.x, start.y);
-        const goalKey = keyOf(goal.x, goal.y);
-
-        if (startKey === goalKey) {
-            return [{ x: start.x, y: start.y }];
+            return {
+                type: GOAL.CHARGE,
+                priority: 0.9,
+                reason: "Akku niedrig, Rückkehr zur Ladestation priorisiert.",
+                explanation: this._explainActiveDecision({
+                    activeGoal: GOAL.CHARGE,
+                    title: "Aktive Entscheidung: Zur Ladestation zurückkehren",
+                    summary:
+                        "Der Akku ist niedrig. Der Agent bricht Missionen ab, " +
+                        "bevor der Rückweg riskant wird.",
+                    priority: "energy",
+                    evidence: [
+                        `Akku: ${Math.round(body.batteryRatio * 100)}%`,
+                        "Home bekannt: ja"
+                    ],
+                    suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.CHARGE)
+                })
+            };
         }
 
-        const queue = [{ x: start.x, y: start.y }];
-        const cameFrom = new Map();
-        const visited = new Set([startKey]);
+        // 5. Utility-basiertes Sammelziel verfolgen.
+        if (
+            bestUtilityTarget &&
+            targetForMission &&
+            knownTargetCount > 0 &&
+            !body.isLoadFull &&
+            this._hasEnergyForMission(position, targetForMission, home, body)
+        ) {
+            this.committedGoal = null;
 
-        cameFrom.set(startKey, null);
+            const utility = bestUtilityTarget.utility;
+            const score = utility ? `${utility.scorePercent}%` : "unbekannt";
 
-        while (queue.length > 0) {
-            const current = queue.shift();
+            return {
+                type: GOAL.COLLECT_TRASH,
+                priority: 0.78,
+                targetId: targetForMission.id,
+                targetConcept: bestUtilityTarget.concept,
+                targetLabel: bestUtilityTarget.label,
+                utilityScore: utility?.score ?? null,
+                reason:
+                    `Bestes Sammelziel nach Utility: ${bestUtilityTarget.label} (${score}). ` +
+                    `${utility?.explanation || ""}`,
+                explanation: this._explainActiveDecision({
+                    activeGoal: GOAL.COLLECT_TRASH,
+                    title: "Aktive Entscheidung: Sammeln",
+                    summary:
+                        `${bestUtilityTarget.label} wurde als bestes Sammelziel gewählt.`,
+                    priority: "mission",
+                    evidence: [
+                        `Utility: ${score}`,
+                        `Konzept: ${bestUtilityTarget.concept}`,
+                        `Distanz: ${utility?.distanceToTarget ?? "?"}`,
+                        `Akku reicht: ${utility?.isEnergyViable ? "ja" : "nein"}`
+                    ],
+                    suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.COLLECT_TRASH)
+                })
+            };
+        }
 
-            const neighbors = this._orderedNeighbors(current, goal, worldModel);
+        // 6. Ziel bekannt, aber Energie/Utility reicht nicht.
+        if (targetForMission && home) {
+            this.committedGoal = GOAL.CHARGE;
 
-            for (const next of neighbors) {
-                const nextKey = keyOf(next.x, next.y);
+            return {
+                type: GOAL.CHARGE,
+                priority: 0.87,
+                reason: "Sammelbares Ziel bekannt, aber Energiebudget oder Utility reicht nicht.",
+                explanation: this._explainActiveDecision({
+                    activeGoal: GOAL.CHARGE,
+                    title: "Aktive Entscheidung: Vor Sammelmission laden",
+                    summary:
+                        "Es gibt ein sammelbares Ziel, aber die Mission wäre energetisch " +
+                        "oder strategisch zu schwach.",
+                    priority: "energy",
+                    evidence: [
+                        `Bestes Ziel: ${bestUtilityTarget?.label || targetForMission.label || "-"}`,
+                        `Akku: ${Math.round(body.batteryRatio * 100)}%`
+                    ],
+                    suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.CHARGE)
+                })
+            };
+        }
 
-                if (visited.has(nextKey)) continue;
-                if (!this._isUsableCell(next, worldModel)) continue;
+        // 7. Neu: Patrouille zu interessanter Region.
+        if (
+            bestPatrolRegion &&
+            bestPatrolRegion.finalScore >= this.config.minPatrolScore &&
+            body.batteryRatio > 0.35 &&
+            !body.isLoadFull
+        ) {
+            this.committedGoal = null;
 
-                visited.add(nextKey);
-                cameFrom.set(nextKey, current);
-                queue.push(next);
+            return {
+                type: GOAL.PATROL_AREA,
+                priority: 0.58,
+                regionId: bestPatrolRegion.id,
+                target: bestPatrolRegion.target,
+                regionScore: bestPatrolRegion.finalScore,
+                reason:
+                    `Region ${bestPatrolRegion.id} erneut prüfen: ` +
+                    `${bestPatrolRegion.summary}`,
+                explanation: this._explainActiveDecision({
+                    activeGoal: GOAL.PATROL_AREA,
+                    title: "Aktive Entscheidung: Ort erneut prüfen",
+                    summary:
+                        `Region ${bestPatrolRegion.id} ist erinnerungsbasiert interessant. ` +
+                        "Der Agent prüft sie erneut, weil dort früher relevante Muster vorkamen.",
+                    priority: "spatial_memory",
+                    evidence: [
+                        `Regionsscore: ${Math.round(bestPatrolRegion.finalScore * 100)}%`,
+                        `Müll gesehen: ${bestPatrolRegion.trashSeen}`,
+                        `Müll gesammelt: ${bestPatrolRegion.trashCollected}`,
+                        `Risiken gesehen: ${bestPatrolRegion.hazardSeen}`,
+                        `Risiko: ${bestPatrolRegion.riskPercent}%`,
+                        `Zusammenfassung: ${bestPatrolRegion.summary}`
+                    ],
+                    suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.PATROL_AREA)
+                })
+            };
+        }
 
-                if (nextKey === goalKey) {
-                    return this._reconstructPath(cameFrom, next);
-                }
+        // 8. Missionsabschluss.
+        const missionLooksComplete = this._missionLooksComplete(knownCoverage, knownTargetCount);
+
+        if (missionLooksComplete && knownTargetCount === 0) {
+            this.committedGoal = null;
+
+            if (atHome) {
+                return {
+                    type: GOAL.STANDBY,
+                    priority: 0.7,
+                    reason:
+                        "Mission wirkt abgeschlossen: kein semantisch sammelbares Ziel " +
+                        "und Basis erreicht.",
+                    explanation: this._explainActiveDecision({
+                        activeGoal: GOAL.STANDBY,
+                        title: "Aktive Entscheidung: Standby",
+                        summary:
+                            "Der Agent kennt kein relevantes Ziel mehr und befindet sich an der Basis.",
+                        priority: "mission_complete",
+                        evidence: [
+                            `Bekannte Welt: ${Math.round(knownCoverage * 100)}%`,
+                            `Sammelbare Ziele: ${knownTargetCount}`
+                        ],
+                        suppressedGoals: []
+                    })
+                };
+            }
+
+            if (home) {
+                return {
+                    type: GOAL.RETURN_HOME,
+                    priority: 0.76,
+                    reason: "Kein semantisch sammelbares Ziel mehr. Kehre zur Basis zurück.",
+                    explanation: this._explainActiveDecision({
+                        activeGoal: GOAL.RETURN_HOME,
+                        title: "Aktive Entscheidung: Mission abschließen",
+                        summary:
+                            "Der Agent findet keine sammelbaren Ziele mehr und kehrt zur Basis zurück.",
+                        priority: "mission_complete",
+                        evidence: [
+                            `Bekannte Welt: ${Math.round(knownCoverage * 100)}%`,
+                            `Sammelbare Ziele: ${knownTargetCount}`
+                        ],
+                        suppressedGoals: []
+                    })
+                };
             }
         }
 
-        return [];
-    }
+        // 9. Standard: erkunden.
+        this.committedGoal = null;
 
-    _reconstructPath(cameFrom, endCell) {
-        const path = [];
-        let current = endCell;
-
-        while (current) {
-            path.push({ x: current.x, y: current.y });
-            current = cameFrom.get(keyOf(current.x, current.y));
-        }
-
-        return path.reverse();
-    }
-
-    _orderedNeighbors(cell, goal, worldModel) {
-        return neighbors4(cell.x, cell.y)
-            .filter(next =>
-                next.x >= 0 &&
-                next.y >= 0 &&
-                next.x < worldModel.width &&
-                next.y < worldModel.height
-            )
-            .map(next => ({
-                ...next,
-                distance: manhattan(next, goal),
-                revisitPenalty: this._recentVisitPenalty(next),
-                knownPenalty: worldModel.isKnown(next.x, next.y) ? 0 : 0.35
-            }))
-            .sort((a, b) => {
-                const scoreA = a.distance + a.revisitPenalty + a.knownPenalty;
-                const scoreB = b.distance + b.revisitPenalty + b.knownPenalty;
-                return scoreA - scoreB;
-            });
-    }
-
-    _bestLocalStep(robot, target, worldModel) {
-        const currentDistance = manhattan(robot, target);
-
-        const candidates = neighbors4(robot.x, robot.y)
-            .filter(cell => this._isUsableCell(cell, worldModel))
-            .map(cell => {
-                const distance = manhattan(cell, target);
-                const improvement = currentDistance - distance;
-                const revisitPenalty = this._recentVisitPenalty(cell);
-                const unknownBonus = worldModel.isKnown(cell.x, cell.y) ? 0 : -0.25;
-
-                return {
-                    ...cell,
-                    score: distance - improvement * 0.4 + revisitPenalty + unknownBonus
-                };
+        return {
+            type: GOAL.EXPLORE,
+            priority: 0.45 + emotions.curiosity * 0.3,
+            reason: "Unbekannte Weltbereiche erkunden.",
+            explanation: this._explainActiveDecision({
+                activeGoal: GOAL.EXPLORE,
+                title: "Aktive Entscheidung: Erkunden",
+                summary:
+                    "Kein dringendes Körperziel, kein gutes Sammelziel und keine starke " +
+                    "Patrouillenregion aktiv. Der Agent erweitert sein Weltmodell.",
+                priority: "curiosity",
+                evidence: [
+                    `Curiosity: ${emotions.curiosity.toFixed(2)}`,
+                    `Bekannte Welt: ${Math.round(knownCoverage * 100)}%`
+                ],
+                suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.EXPLORE)
             })
-            .sort((a, b) => a.score - b.score);
-
-        return candidates[0] || null;
+        };
     }
 
-    _minDistanceToHazards(position, hazards) {
-        if (!hazards || hazards.length === 0) return Infinity;
+    _makeSuppressedOptions({ body, atHome, nearestTarget, home, knownTargetCount, knownCoverage, needs, bestPatrolRegion }) {
+        const options = [];
 
-        return Math.min(
-            ...hazards.map(item => manhattan(position, item.entity || item))
-        );
+        if (body.trashLoad > 0 || body.isLoadFull) {
+            options.push({
+                goal: GOAL.EMPTY_LOAD,
+                label: "Entladen",
+                reason:
+                    body.isLoadFull
+                        ? "Behälter ist voll."
+                        : "Es befindet sich Müll im Behälter."
+            });
+        }
+
+        if (body.isBatteryLow || body.isBatteryCritical || needs.returnRisk > 0.2) {
+            options.push({
+                goal: GOAL.CHARGE,
+                label: "Laden",
+                reason:
+                    `Akku/Rückweg relevant. Akku: ${Math.round(body.batteryRatio * 100)}%, ` +
+                    `Return Risk: ${needs.returnRisk.toFixed(2)}.`
+            });
+        }
+
+        if (nearestTarget) {
+            options.push({
+                goal: GOAL.COLLECT_TRASH,
+                label: "Sammeln",
+                reason:
+                    `Bestes Sammelziel wäre ${nearestTarget.label} ` +
+                    `(${nearestTarget.utility?.scorePercent ?? "?"}% Utility).`
+            });
+        }
+
+        if (bestPatrolRegion) {
+            options.push({
+                goal: GOAL.PATROL_AREA,
+                label: "Region prüfen",
+                reason:
+                    `Region ${bestPatrolRegion.id} wäre interessant ` +
+                    `(${Math.round(bestPatrolRegion.finalScore * 100)}%).`
+            });
+        }
+
+        if (knownTargetCount === 0 && knownCoverage < this.config.missionCoverageThreshold) {
+            options.push({
+                goal: GOAL.EXPLORE,
+                label: "Erkunden",
+                reason:
+                    `Welt erst zu ${Math.round(knownCoverage * 100)}% bekannt.`
+            });
+        }
+
+        if (home && !atHome && knownTargetCount === 0) {
+            options.push({
+                goal: GOAL.RETURN_HOME,
+                label: "Zur Basis",
+                reason: "Kein Ziel bekannt, Basis ist bekannt."
+            });
+        }
+
+        return options;
     }
 
-    _isUsableCell(cell, worldModel) {
-        if (cell.x < 0 || cell.y < 0) return false;
-        if (cell.x >= worldModel.width || cell.y >= worldModel.height) return false;
-        if (worldModel.isKnownBlocked(cell.x, cell.y)) return false;
-
-        return true;
+    _filterSuppressed(options, activeGoal) {
+        return options.filter(option => option.goal !== activeGoal);
     }
 
-    _rememberPosition(robot) {
-        const key = keyOf(robot.x, robot.y);
+    _explainActiveDecision({ activeGoal, title, summary, priority, evidence = [], suppressedGoals = [] }) {
+        return {
+            activeGoal,
+            title,
+            summary,
+            priority,
+            evidence,
+            suppressedGoals
+        };
+    }
 
-        this.recentPositions.push(key);
-
-        if (this.recentPositions.length > 10) {
-            this.recentPositions.shift();
+    _updateMissionMemory(knownTargetCount) {
+        if (knownTargetCount > 0) {
+            this.ticksWithoutKnownTrash = 0;
+        } else {
+            this.ticksWithoutKnownTrash++;
         }
     }
 
-    _recentVisitPenalty(cell) {
-        const key = keyOf(cell.x, cell.y);
-        const index = this.recentPositions.lastIndexOf(key);
+    _missionLooksComplete(knownCoverage, knownTargetCount) {
+        if (knownTargetCount > 0) return false;
 
-        if (index === -1) return 0;
+        if (knownCoverage >= this.config.missionCoverageThreshold) {
+            return true;
+        }
 
-        const age = this.recentPositions.length - 1 - index;
+        if (this.ticksWithoutKnownTrash >= this.config.maxTicksWithoutKnownTrash) {
+            return true;
+        }
 
-        return Math.max(0, 2.5 - age * 0.35);
+        return false;
+    }
+
+    _hasEnergyForMission(position, target, home, body) {
+        if (!home) {
+            return body.batteryRatio > 0.55;
+        }
+
+        const distanceToTarget = manhattan(position, target);
+        const distanceTargetToHome = manhattan(target, home);
+
+        const estimatedMissionCost =
+            (distanceToTarget + distanceTargetToHome) *
+            this.config.moveCostEstimate +
+            this.config.reserveBattery;
+
+        return body.battery >= estimatedMissionCost;
     }
 }

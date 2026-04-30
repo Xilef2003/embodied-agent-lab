@@ -2,17 +2,16 @@ import { GOAL } from "../config.js";
 import { manhattan } from "../utils/Grid.js";
 
 /**
- * GoalSystem v1.0
+ * GoalSystem v1.1
  *
  * Neu:
- * - Safety Commitment:
- *   Wenn ein Mensch/Tier zu nah ist, bleibt AVOID aktiv,
- *   bis ein stabiler Sicherheitsabstand erreicht ist.
+ * - SpatialMemory:
+ *   Wenn kein direktes Sammelziel aktiv ist, kann der Agent gezielt
+ *   interessante Regionen erneut prüfen.
  *
- * - Active Decision Explanation:
- *   Jedes Ziel bekommt eine Erklärung:
- *   Warum ist dieses Ziel gerade aktiv?
- *   Welche Ziele wurden unterdrückt?
+ * - Patrol Area:
+ *   "Dort habe ich früher Müll/Tiere/Ungewissheit gesehen,
+ *    also schaue ich dort wieder nach."
  */
 export class GoalSystem {
     constructor(options = {}) {
@@ -25,12 +24,10 @@ export class GoalSystem {
             maxTicksWithoutKnownTrash: 180,
             minUtilityToStartMission: 0.18,
 
-            // Safety Commitment:
-            // Trigger: ab dieser Nähe wird Sicherheitsmodus aktiviert.
             safetyTriggerDistance: 1,
-
-            // Release: erst ab diesem Abstand darf der Agent wieder zur Mission wechseln.
             safetyReleaseDistance: 3,
+
+            minPatrolScore: 0.28,
 
             ...options
         };
@@ -40,7 +37,7 @@ export class GoalSystem {
         this.ticksWithoutKnownTrash = 0;
     }
 
-    choose(needs, emotions, robot, worldModel, semantic = null) {
+    choose(needs, emotions, robot, worldModel, semantic = null, spatial = null) {
         const body = robot.body;
         const position = robot.position;
         const home = worldModel.home;
@@ -72,6 +69,8 @@ export class GoalSystem {
         const knownTargetCount = collectableTargets.length || fallbackKnownTrash.length;
         const targetForMission = nearestTarget || fallbackNearestTrash;
 
+        const bestPatrolRegion = spatial?.bestPatrolRegion || null;
+
         const knownCoverage = worldModel.getKnownCellRatio();
 
         this._updateMissionMemory(knownTargetCount);
@@ -83,7 +82,8 @@ export class GoalSystem {
             home,
             knownTargetCount,
             knownCoverage,
-            needs
+            needs,
+            bestPatrolRegion
         });
 
         // 1. Safety Commitment bleibt aktiv, bis Abstand wirklich wiederhergestellt ist.
@@ -139,7 +139,7 @@ export class GoalSystem {
                     title: "Aktive Entscheidung: Sicherheits-Override",
                     summary:
                         `${immediateHazard.label} ist zu nah. Sicherheit überschreibt ` +
-                        `Entladen, Sammeln, Erkunden und Laden.`,
+                        `Entladen, Sammeln, Erkunden, Patrouille und Laden.`,
                     priority: "safety",
                     evidence: [
                         `${immediateHazard.label} Distanz: ${immediateHazard.distance}`,
@@ -189,7 +189,7 @@ export class GoalSystem {
                     title: "Aktive Entscheidung: Behälter voll",
                     summary:
                         "Der Agent kann keine weiteren Objekte aufnehmen. " +
-                        "Entladen hat Vorrang vor Sammeln.",
+                        "Entladen hat Vorrang vor Sammeln und Patrouille.",
                     priority: "body_state",
                     evidence: [
                         `Müllbehälter: ${body.trashLoad}/${body.maxTrashLoad}`,
@@ -215,7 +215,7 @@ export class GoalSystem {
                         "Er entlädt, bevor er neue Ziele verfolgt.",
                     priority: "body_state",
                     evidence: [
-                        `Position: Basis`,
+                        "Position: Basis",
                         `Müllbehälter: ${body.trashLoad}/${body.maxTrashLoad}`
                     ],
                     suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.EMPTY_LOAD)
@@ -315,14 +315,116 @@ export class GoalSystem {
                     priority: "energy",
                     evidence: [
                         `Akku: ${Math.round(body.batteryRatio * 100)}%`,
-                        `Home bekannt: ja`
+                        "Home bekannt: ja"
                     ],
                     suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.CHARGE)
                 })
             };
         }
 
-        // 5. Missionsabschluss.
+        // 5. Utility-basiertes Sammelziel verfolgen.
+        if (
+            bestUtilityTarget &&
+            targetForMission &&
+            knownTargetCount > 0 &&
+            !body.isLoadFull &&
+            this._hasEnergyForMission(position, targetForMission, home, body)
+        ) {
+            this.committedGoal = null;
+
+            const utility = bestUtilityTarget.utility;
+            const score = utility ? `${utility.scorePercent}%` : "unbekannt";
+
+            return {
+                type: GOAL.COLLECT_TRASH,
+                priority: 0.78,
+                targetId: targetForMission.id,
+                targetConcept: bestUtilityTarget.concept,
+                targetLabel: bestUtilityTarget.label,
+                utilityScore: utility?.score ?? null,
+                reason:
+                    `Bestes Sammelziel nach Utility: ${bestUtilityTarget.label} (${score}). ` +
+                    `${utility?.explanation || ""}`,
+                explanation: this._explainActiveDecision({
+                    activeGoal: GOAL.COLLECT_TRASH,
+                    title: "Aktive Entscheidung: Sammeln",
+                    summary:
+                        `${bestUtilityTarget.label} wurde als bestes Sammelziel gewählt.`,
+                    priority: "mission",
+                    evidence: [
+                        `Utility: ${score}`,
+                        `Konzept: ${bestUtilityTarget.concept}`,
+                        `Distanz: ${utility?.distanceToTarget ?? "?"}`,
+                        `Akku reicht: ${utility?.isEnergyViable ? "ja" : "nein"}`
+                    ],
+                    suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.COLLECT_TRASH)
+                })
+            };
+        }
+
+        // 6. Ziel bekannt, aber Energie/Utility reicht nicht.
+        if (targetForMission && home) {
+            this.committedGoal = GOAL.CHARGE;
+
+            return {
+                type: GOAL.CHARGE,
+                priority: 0.87,
+                reason: "Sammelbares Ziel bekannt, aber Energiebudget oder Utility reicht nicht.",
+                explanation: this._explainActiveDecision({
+                    activeGoal: GOAL.CHARGE,
+                    title: "Aktive Entscheidung: Vor Sammelmission laden",
+                    summary:
+                        "Es gibt ein sammelbares Ziel, aber die Mission wäre energetisch " +
+                        "oder strategisch zu schwach.",
+                    priority: "energy",
+                    evidence: [
+                        `Bestes Ziel: ${bestUtilityTarget?.label || targetForMission.label || "-"}`,
+                        `Akku: ${Math.round(body.batteryRatio * 100)}%`
+                    ],
+                    suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.CHARGE)
+                })
+            };
+        }
+
+        // 7. Neu: Patrouille zu interessanter Region.
+        if (
+            bestPatrolRegion &&
+            bestPatrolRegion.finalScore >= this.config.minPatrolScore &&
+            body.batteryRatio > 0.35 &&
+            !body.isLoadFull
+        ) {
+            this.committedGoal = null;
+
+            return {
+                type: GOAL.PATROL_AREA,
+                priority: 0.58,
+                regionId: bestPatrolRegion.id,
+                target: bestPatrolRegion.target,
+                regionScore: bestPatrolRegion.finalScore,
+                reason:
+                    `Region ${bestPatrolRegion.id} erneut prüfen: ` +
+                    `${bestPatrolRegion.summary}`,
+                explanation: this._explainActiveDecision({
+                    activeGoal: GOAL.PATROL_AREA,
+                    title: "Aktive Entscheidung: Ort erneut prüfen",
+                    summary:
+                        `Region ${bestPatrolRegion.id} ist erinnerungsbasiert interessant. ` +
+                        "Der Agent prüft sie erneut, weil dort früher relevante Muster vorkamen.",
+                    priority: "spatial_memory",
+                    evidence: [
+                        `Regionsscore: ${Math.round(bestPatrolRegion.finalScore * 100)}%`,
+                        `Müll gesehen: ${bestPatrolRegion.trashSeen}`,
+                        `Müll gesammelt: ${bestPatrolRegion.trashCollected}`,
+                        `Risiken gesehen: ${bestPatrolRegion.hazardSeen}`,
+                        `Risiko: ${bestPatrolRegion.riskPercent}%`,
+                        `Zusammenfassung: ${bestPatrolRegion.summary}`
+                    ],
+                    suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.PATROL_AREA)
+                })
+            };
+        }
+
+        // 8. Missionsabschluss.
         const missionLooksComplete = this._missionLooksComplete(knownCoverage, knownTargetCount);
 
         if (missionLooksComplete && knownTargetCount === 0) {
@@ -371,71 +473,7 @@ export class GoalSystem {
             }
         }
 
-        // 6. Utility-basiertes Sammelziel verfolgen.
-        if (
-            bestUtilityTarget &&
-            targetForMission &&
-            knownTargetCount > 0 &&
-            !body.isLoadFull &&
-            this._hasEnergyForMission(position, targetForMission, home, body)
-        ) {
-            this.committedGoal = null;
-
-            const utility = bestUtilityTarget.utility;
-            const score = utility ? `${utility.scorePercent}%` : "unbekannt";
-
-            return {
-                type: GOAL.COLLECT_TRASH,
-                priority: 0.78,
-                targetId: targetForMission.id,
-                targetConcept: bestUtilityTarget.concept,
-                targetLabel: bestUtilityTarget.label,
-                utilityScore: utility?.score ?? null,
-                reason:
-                    `Bestes Sammelziel nach Utility: ${bestUtilityTarget.label} (${score}). ` +
-                    `${utility?.explanation || ""}`,
-                explanation: this._explainActiveDecision({
-                    activeGoal: GOAL.COLLECT_TRASH,
-                    title: "Aktive Entscheidung: Sammeln",
-                    summary:
-                        `${bestUtilityTarget.label} wurde als bestes Sammelziel gewählt.`,
-                    priority: "mission",
-                    evidence: [
-                        `Utility: ${score}`,
-                        `Konzept: ${bestUtilityTarget.concept}`,
-                        `Distanz: ${utility?.distanceToTarget ?? "?"}`,
-                        `Akku reicht: ${utility?.isEnergyViable ? "ja" : "nein"}`
-                    ],
-                    suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.COLLECT_TRASH)
-                })
-            };
-        }
-
-        // 7. Ziel bekannt, aber Energie/Utility reicht nicht.
-        if (targetForMission && home) {
-            this.committedGoal = GOAL.CHARGE;
-
-            return {
-                type: GOAL.CHARGE,
-                priority: 0.87,
-                reason: "Sammelbares Ziel bekannt, aber Energiebudget oder Utility reicht nicht.",
-                explanation: this._explainActiveDecision({
-                    activeGoal: GOAL.CHARGE,
-                    title: "Aktive Entscheidung: Vor Sammelmission laden",
-                    summary:
-                        "Es gibt ein sammelbares Ziel, aber die Mission wäre energetisch " +
-                        "oder strategisch zu schwach.",
-                    priority: "energy",
-                    evidence: [
-                        `Bestes Ziel: ${bestUtilityTarget?.label || targetForMission.label || "-"}`,
-                        `Akku: ${Math.round(body.batteryRatio * 100)}%`
-                    ],
-                    suppressedGoals: this._filterSuppressed(suppressedBase, GOAL.CHARGE)
-                })
-            };
-        }
-
-        // 8. Standard: erkunden.
+        // 9. Standard: erkunden.
         this.committedGoal = null;
 
         return {
@@ -446,8 +484,8 @@ export class GoalSystem {
                 activeGoal: GOAL.EXPLORE,
                 title: "Aktive Entscheidung: Erkunden",
                 summary:
-                    "Kein dringendes Körperziel und kein gutes Sammelziel aktiv. " +
-                    "Der Agent erweitert sein Weltmodell.",
+                    "Kein dringendes Körperziel, kein gutes Sammelziel und keine starke " +
+                    "Patrouillenregion aktiv. Der Agent erweitert sein Weltmodell.",
                 priority: "curiosity",
                 evidence: [
                     `Curiosity: ${emotions.curiosity.toFixed(2)}`,
@@ -458,7 +496,7 @@ export class GoalSystem {
         };
     }
 
-    _makeSuppressedOptions({ body, atHome, nearestTarget, home, knownTargetCount, knownCoverage, needs }) {
+    _makeSuppressedOptions({ body, atHome, nearestTarget, home, knownTargetCount, knownCoverage, needs, bestPatrolRegion }) {
         const options = [];
 
         if (body.trashLoad > 0 || body.isLoadFull) {
@@ -489,6 +527,16 @@ export class GoalSystem {
                 reason:
                     `Bestes Sammelziel wäre ${nearestTarget.label} ` +
                     `(${nearestTarget.utility?.scorePercent ?? "?"}% Utility).`
+            });
+        }
+
+        if (bestPatrolRegion) {
+            options.push({
+                goal: GOAL.PATROL_AREA,
+                label: "Region prüfen",
+                reason:
+                    `Region ${bestPatrolRegion.id} wäre interessant ` +
+                    `(${Math.round(bestPatrolRegion.finalScore * 100)}%).`
             });
         }
 
