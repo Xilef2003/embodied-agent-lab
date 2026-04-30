@@ -2,22 +2,14 @@ import { GOAL } from "../config.js";
 import { manhattan } from "../utils/Grid.js";
 
 /**
- * GoalSystem v0.3
+ * GoalSystem v0.4
  *
- * Wichtigste Änderung:
- * v0.2 konnte zu früh von der Ladestation losfahren:
- *
- *   laden -> ein Schritt Richtung Müll -> sofort wieder zurück -> laden -> ...
- *
- * Das war kein Pathfinding-Fehler, sondern ein Zielwechsel-Fehler.
- * Deshalb gibt es jetzt Goal-Commitment:
- *
- * - Wenn CHARGE aktiv ist, bleibt der Roboter beim Laden,
- *   bis der Akku ausreichend voll ist.
- * - Wenn EMPTY_LOAD aktiv ist, bleibt der Roboter beim Entladen,
- *   bis der Behälter leer ist.
- * - Eine Müllmission wird nur gestartet, wenn genug Energie für
- *   Hinweg + Rückweg + Sicherheitsreserve vorhanden ist.
+ * Neu:
+ * - Der Roboter erkundet nicht endlos weiter.
+ * - Wenn genug Welt bekannt ist und kein Müll mehr bekannt ist,
+ *   kehrt er zur Basis zurück.
+ * - An der Basis geht er in Standby.
+ * - Wenn später wieder Müll bekannt wird, kann er erneut los.
  */
 export class GoalSystem {
     constructor(options = {}) {
@@ -26,10 +18,20 @@ export class GoalSystem {
             leaveBaseMinBatteryRatio: 0.55,
             reserveBattery: 14,
             moveCostEstimate: 0.7,
+
+            // Ab diesem bekannten Weltanteil darf der Agent sagen:
+            // "Ich habe genug abgesucht."
+            missionCoverageThreshold: 0.88,
+
+            // Falls lange kein Müll bekannt war, soll er auch ohne 88% Coverage
+            // irgendwann zur Basis zurückkehren.
+            maxTicksWithoutKnownTrash: 180,
+
             ...options
         };
 
         this.committedGoal = null;
+        this.ticksWithoutKnownTrash = 0;
     }
 
     choose(needs, emotions, robot, worldModel) {
@@ -37,9 +39,15 @@ export class GoalSystem {
         const position = robot.position;
         const home = worldModel.home;
         const atHome = Boolean(home && manhattan(position, home) === 0);
-        const hazards = worldModel.getKnownHazards(position, 1);
 
-        // Sicherheit darf jedes andere Ziel überschreiben.
+        const hazards = worldModel.getKnownHazards(position, 1);
+        const knownTrash = worldModel.getKnownTrash();
+        const nearestTrash = worldModel.getNearestKnownTrash(position);
+        const knownCoverage = worldModel.getKnownCellRatio();
+
+        this._updateMissionMemory(knownTrash.length);
+
+        // 1. Sicherheit überschreibt alles.
         if (hazards.length > 0 && emotions.caution > 0.35) {
             this.committedGoal = null;
 
@@ -50,8 +58,7 @@ export class GoalSystem {
             };
         }
 
-        // Wenn der Roboter voll ist, muss er zur Basis.
-        // Dieses Ziel bleibt aktiv, bis der Behälter leer ist.
+        // 2. Entladen bleibt aktiv, bis der Behälter leer ist.
         if (this.committedGoal === GOAL.EMPTY_LOAD) {
             if (body.trashLoad > 0) {
                 return {
@@ -74,8 +81,7 @@ export class GoalSystem {
             };
         }
 
-        // Wenn der Roboter zufällig an der Basis ist und Müll geladen hat,
-        // soll er entladen, auch wenn der Behälter nicht voll ist.
+        // Wenn er an der Basis ist und Müll geladen hat, zuerst abgeben.
         if (atHome && body.trashLoad > 0) {
             this.committedGoal = GOAL.EMPTY_LOAD;
 
@@ -86,8 +92,7 @@ export class GoalSystem {
             };
         }
 
-        // CHARGE-Commitment:
-        // Wenn Laden aktiv ist, bleibt es aktiv, bis der Akku wieder sinnvoll voll ist.
+        // 3. Laden bleibt aktiv, bis genug Akku da ist.
         if (this.committedGoal === GOAL.CHARGE) {
             if (!atHome || body.batteryRatio < this.config.chargeUntilRatio) {
                 return {
@@ -100,7 +105,6 @@ export class GoalSystem {
             this.committedGoal = null;
         }
 
-        // Kritischer Akku oder Rückwegrisiko: sofort laden.
         if (body.isBatteryCritical || needs.returnRisk > 0.35) {
             this.committedGoal = GOAL.CHARGE;
 
@@ -111,8 +115,7 @@ export class GoalSystem {
             };
         }
 
-        // Wenn der Roboter an der Basis ist, soll er nicht mit halb leerem Akku
-        // sofort wieder losfahren. Erst sinnvoll aufladen.
+        // An der Basis nicht mit zu wenig Akku losfahren.
         if (atHome && body.batteryRatio < this.config.leaveBaseMinBatteryRatio) {
             this.committedGoal = GOAL.CHARGE;
 
@@ -123,7 +126,6 @@ export class GoalSystem {
             };
         }
 
-        // Niedriger Akku unterwegs: zurück zur Ladestation.
         if (body.isBatteryLow && home) {
             this.committedGoal = GOAL.CHARGE;
 
@@ -134,9 +136,31 @@ export class GoalSystem {
             };
         }
 
-        const knownTrash = worldModel.getKnownTrash();
-        const nearestTrash = worldModel.getNearestKnownTrash(position);
+        // 4. Mission abgeschlossen?
+        // Kein bekannter Müll + genug erkundet oder lange nichts gefunden.
+        const missionLooksComplete = this._missionLooksComplete(knownCoverage, knownTrash.length);
 
+        if (missionLooksComplete && knownTrash.length === 0) {
+            this.committedGoal = null;
+
+            if (atHome) {
+                return {
+                    type: GOAL.STANDBY,
+                    priority: 0.7,
+                    reason: "Mission wirkt abgeschlossen: kein bekannter Müll und Basis erreicht."
+                };
+            }
+
+            if (home) {
+                return {
+                    type: GOAL.RETURN_HOME,
+                    priority: 0.76,
+                    reason: "Kein bekannter Müll mehr. Kehre zur Basis zurück."
+                };
+            }
+        }
+
+        // 5. Müll sammeln, aber nur wenn die Energie für Hinweg + Rückweg reicht.
         if (
             nearestTrash &&
             knownTrash.length > 0 &&
@@ -152,8 +176,7 @@ export class GoalSystem {
             };
         }
 
-        // Wenn Müll bekannt ist, aber die Energie für die Mission nicht reicht,
-        // wird erst geladen statt halb loszufahren.
+        // Müll ist bekannt, aber Energie reicht nicht sicher.
         if (nearestTrash && home && !this._hasEnergyForTrashMission(position, nearestTrash, home, body)) {
             this.committedGoal = GOAL.CHARGE;
 
@@ -164,6 +187,7 @@ export class GoalSystem {
             };
         }
 
+        // 6. Standard: erkunden.
         this.committedGoal = null;
 
         return {
@@ -171,6 +195,28 @@ export class GoalSystem {
             priority: 0.45 + emotions.curiosity * 0.3,
             reason: "Unbekannte Weltbereiche erkunden."
         };
+    }
+
+    _updateMissionMemory(knownTrashCount) {
+        if (knownTrashCount > 0) {
+            this.ticksWithoutKnownTrash = 0;
+        } else {
+            this.ticksWithoutKnownTrash++;
+        }
+    }
+
+    _missionLooksComplete(knownCoverage, knownTrashCount) {
+        if (knownTrashCount > 0) return false;
+
+        if (knownCoverage >= this.config.missionCoverageThreshold) {
+            return true;
+        }
+
+        if (this.ticksWithoutKnownTrash >= this.config.maxTicksWithoutKnownTrash) {
+            return true;
+        }
+
+        return false;
     }
 
     _hasEnergyForTrashMission(position, trash, home, body) {
@@ -182,7 +228,8 @@ export class GoalSystem {
         const distanceTrashToHome = manhattan(trash, home);
 
         const estimatedMissionCost =
-            (distanceToTrash + distanceTrashToHome) * this.config.moveCostEstimate +
+            (distanceToTrash + distanceTrashToHome) *
+            this.config.moveCostEstimate +
             this.config.reserveBattery;
 
         return body.battery >= estimatedMissionCost;

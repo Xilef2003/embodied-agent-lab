@@ -163,6 +163,10 @@ export class Renderer {
         const action = state.action;
         const needs = state.needs || {};
         const emotions = state.emotions || {};
+        const semantic = state.semantic || {};
+
+        const topSemanticTarget = semantic.collectableTargets?.[0];
+        const topHazard = semantic.hazards?.[0];
 
         this.statsElement.innerHTML = `
             ${metric("Tick", world.step)}
@@ -174,6 +178,12 @@ export class Renderer {
             ${metric("Aktion", `${action?.type || "-"}<br><span style="color:#6b7280">${action?.reason || ""}</span>`)}
             ${metric("Bekannte Welt", `${Math.round((state.knownCellsRatio || 0) * 100)}% ${bar(state.knownCellsRatio || 0)}`)}
             ${metric("Bekannter Müll", state.knownTrashCount)}
+            ${metric("Sem. Sammelziele", state.semanticCollectableCount)}
+            ${metric("Sem. Risiken", state.semanticHazardCount)}
+            ${metric("Relationen", state.relationCount)}
+            ${metric("Affordances", state.affordanceCount)}
+            ${metric("Nächstes Ziel", topSemanticTarget ? `${topSemanticTarget.label}<br><span style="color:#6b7280">${topSemanticTarget.concept} → collect</span>` : "-")}
+            ${metric("Nächstes Risiko", topHazard ? `${topHazard.label}<br><span style="color:#6b7280">${topHazard.concept} → keep_distance</span>` : "-")}
             ${metric("Home bekannt", state.homeKnown ? "ja" : "nein")}
             ${metric("Bedürfnisse", formatMap(needs))}
             ${metric("Emotionen", formatMap(emotions))}

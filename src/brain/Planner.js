@@ -2,13 +2,11 @@ import { ACTION, GOAL } from "../config.js";
 import { keyOf, manhattan, neighbors4 } from "../utils/Grid.js";
 
 /**
- * Planner v0.2
+ * Planner v0.5
  *
- * Wichtigste Änderung gegenüber v0.1:
- * - kein rein gieriges "immer einen Schritt Richtung Ziel" mehr
- * - stattdessen BFS-Pfadsuche über das bekannte Weltmodell
- * - Anti-Ping-Pong-Logik gegen Pendeln zwischen zwei Feldern
- * - wenn kein Pfad bekannt ist: explorativ in Richtung Ziel scannen/bewegen
+ * Neu:
+ * - COLLECT_TRASH nutzt semantisch sammelbare Ziele aus SemanticMemory
+ * - Log sagt jetzt, welches Objekt aus welchem semantischen Grund angesteuert wird
  */
 export class Planner {
     constructor() {
@@ -17,7 +15,7 @@ export class Planner {
         this.recentPositions = [];
     }
 
-    plan(goal, worldModel, robot, observation, emotions) {
+    plan(goal, worldModel, robot, observation, emotions, semantic = null) {
         this._rememberPosition(robot);
         this.lastGoal = goal;
 
@@ -33,11 +31,19 @@ export class Planner {
                 break;
 
             case GOAL.COLLECT_TRASH:
-                action = this._planCollectTrash(worldModel, robot);
+                action = this._planCollectTrash(worldModel, robot, semantic);
                 break;
 
             case GOAL.AVOID:
-                action = this._planAvoid(worldModel, robot);
+                action = this._planAvoid(worldModel, robot, semantic);
+                break;
+
+            case GOAL.RETURN_HOME:
+                action = this._planReturnHome(worldModel, robot);
+                break;
+
+            case GOAL.STANDBY:
+                action = this._planStandby();
                 break;
 
             case GOAL.EXPLORE:
@@ -86,38 +92,72 @@ export class Planner {
         return this._moveToward(robot, worldModel.home, worldModel, "Zur Basis zurückkehren.");
     }
 
-    _planCollectTrash(worldModel, robot) {
-        const target = worldModel.getNearestKnownTrash(robot.position);
+    _planReturnHome(worldModel, robot) {
+        if (!worldModel.home) {
+            return {
+                type: ACTION.SCAN,
+                reason: "Basis unbekannt, scanne Umgebung."
+            };
+        }
+
+        if (manhattan(robot, worldModel.home) === 0) {
+            return {
+                type: ACTION.IDLE,
+                reason: "Basis erreicht. Warte auf neues Ziel."
+            };
+        }
+
+        return this._moveToward(robot, worldModel.home, worldModel, "Mission abgeschlossen, Rückkehr zur Basis.");
+    }
+
+    _planStandby() {
+        return {
+            type: ACTION.IDLE,
+            reason: "Standby: Mission abgeschlossen, keine semantisch sammelbaren Ziele."
+        };
+    }
+
+    _planCollectTrash(worldModel, robot, semantic = null) {
+        const semanticTarget = semantic?.collectableTargets?.[0] || null;
+        const target = semanticTarget?.entity || worldModel.getNearestKnownTrash(robot.position);
 
         if (!target) {
             return {
                 type: ACTION.SCAN,
-                reason: "Kein konkreter Müll bekannt."
+                reason: "Kein konkretes sammelbares Ziel bekannt."
             };
         }
 
         if (manhattan(robot, target) <= 1) {
+            const semanticReason = semanticTarget
+                ? `${semanticTarget.label} ist '${semanticTarget.concept}' mit Affordance collect.`
+                : `${target.label} ist als Müll markiert.`;
+
             return {
                 type: ACTION.PICKUP,
                 targetId: target.id,
-                reason: `${target.label} greifen.`
+                reason: `${target.label} greifen. ${semanticReason}`
             };
         }
 
-        return this._moveToward(robot, target, worldModel, `${target.label} ansteuern.`);
+        const reason = semanticTarget
+            ? `${target.label} ansteuern. Semantik: ${semanticTarget.concept} -> collect.`
+            : `${target.label} ansteuern.`;
+
+        return this._moveToward(robot, target, worldModel, reason);
     }
 
-    _planAvoid(worldModel, robot) {
+    _planAvoid(worldModel, robot, semantic = null) {
+        const semanticHazard = semantic?.hazards?.find(item => item.distance <= 2) || null;
         const hazards = worldModel.getKnownHazards(robot.position, 2);
+        const hazard = semanticHazard?.entity || hazards[0];
 
-        if (hazards.length === 0) {
+        if (!hazard) {
             return {
                 type: ACTION.SCAN,
                 reason: "Risiko nicht mehr sichtbar, scanne neu."
             };
         }
-
-        const hazard = hazards[0];
 
         const candidates = neighbors4(robot.x, robot.y)
             .filter(cell => this._isUsableCell(cell, worldModel))
@@ -141,11 +181,15 @@ export class Planner {
             };
         }
 
+        const semanticText = semanticHazard
+            ? ` Semantik: ${semanticHazard.concept} -> keep_distance.`
+            : "";
+
         return {
             type: ACTION.MOVE,
             dx: best.x - robot.x,
             dy: best.y - robot.y,
-            reason: `Von Risiko ${hazard.label} entfernen.`
+            reason: `Von Risiko ${hazard.label} entfernen.${semanticText}`
         };
     }
 
@@ -183,8 +227,6 @@ export class Planner {
             };
         }
 
-        // Kein vollständiger Pfad bekannt.
-        // Dann nicht pendeln, sondern den besten lokalen Schritt nehmen.
         const local = this._bestLocalStep(robot, target, worldModel);
 
         if (local) {
@@ -223,6 +265,7 @@ export class Planner {
 
             for (const next of neighbors) {
                 const nextKey = keyOf(next.x, next.y);
+
                 if (visited.has(nextKey)) continue;
                 if (!this._isUsableCell(next, worldModel)) continue;
 
@@ -253,7 +296,12 @@ export class Planner {
 
     _orderedNeighbors(cell, goal, worldModel) {
         return neighbors4(cell.x, cell.y)
-            .filter(next => next.x >= 0 && next.y >= 0 && next.x < worldModel.width && next.y < worldModel.height)
+            .filter(next =>
+                next.x >= 0 &&
+                next.y >= 0 &&
+                next.x < worldModel.width &&
+                next.y < worldModel.height
+            )
             .map(next => ({
                 ...next,
                 distance: manhattan(next, goal),
@@ -314,8 +362,6 @@ export class Planner {
 
         const age = this.recentPositions.length - 1 - index;
 
-        // Direktes Zurücklaufen wird stark bestraft,
-        // ältere Besuche nur leicht.
         return Math.max(0, 2.5 - age * 0.35);
     }
 }

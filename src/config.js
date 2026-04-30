@@ -37,5 +37,7 @@ export const GOAL = Object.freeze({
     EMPTY_LOAD: "empty_load",
     COLLECT_TRASH: "collect_trash",
     EXPLORE: "explore",
-    AVOID: "avoid"
+    AVOID: "avoid",
+    RETURN_HOME: "return_home",
+    STANDBY: "standby"
 });
